@@ -502,8 +502,8 @@ mod tests {
     #[test]
     fn test_events_include_caller() {
         use soroban_sdk::testutils::Events;
-        use soroban_sdk::{symbol_short, IntoVal};
-        
+        use soroban_sdk::Event;
+
         let (env, admin, contract_id) = setup();
         let client = RoleStoreClient::new(&env, &contract_id);
         let ctrl = roles::controller(&env);
@@ -511,32 +511,26 @@ mod tests {
 
         client.grant_role(&admin, &keeper, &ctrl);
         
-        let events = env.events().all();
-        assert!(
-            events.contains((
-                contract_id.clone(),
-                (symbol_short!("grant"),).into_val(&env),
-                RoleGranted {
-                    caller: admin.clone(),
-                    account: keeper.clone(),
-                    role: ctrl.clone(),
-                }.into_val(&env)
-            ))
+        assert_eq!(
+            env.events().all().filter_by_contract(&contract_id),
+            [RoleGranted {
+                caller: admin.clone(),
+                account: keeper.clone(),
+                role: ctrl.clone(),
+            }
+            .to_xdr(&env, &contract_id)]
         );
 
         client.revoke_role(&admin, &keeper, &ctrl);
         
-        let events = env.events().all();
-        assert!(
-            events.contains((
-                contract_id.clone(),
-                (symbol_short!("revoke"),).into_val(&env),
-                RoleRevoked {
-                    caller: admin.clone(),
-                    account: keeper.clone(),
-                    role: ctrl.clone(),
-                }.into_val(&env)
-            ))
+        assert_eq!(
+            env.events().all().filter_by_contract(&contract_id),
+            [RoleRevoked {
+                caller: admin.clone(),
+                account: keeper.clone(),
+                role: ctrl.clone(),
+            }
+            .to_xdr(&env, &contract_id)]
         );
     }
 

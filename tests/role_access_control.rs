@@ -78,6 +78,9 @@ fn setup() -> TestWorld {
     let rs_c = RsClient::new(&env, &rs);
     rs_c.initialize(&admin);
     rs_c.grant_role(&admin, &admin, &roles::controller(&env));
+    // Admin publishes oracle prices, which requires ORDER_KEEPER. Admin never
+    // executes orders here, so this doesn't affect the access checks under test.
+    rs_c.grant_role(&admin, &admin, &roles::order_keeper(&env));
 
     // Data store
     let ds = env.register(DataStore, ());
@@ -113,6 +116,9 @@ fn setup() -> TestWorld {
     // Order handler
     let ord_handler = env.register(OrderHandler, ());
     OHClient::new(&env, &ord_handler).initialize(&admin, &rs, &ds, &oracle_addr, &ord_vault);
+    // Matches scripts/deploy.sh: order_handler writes to data_store and the
+    // order vault, both of which require CONTROLLER.
+    rs_c.grant_role(&admin, &ord_handler, &roles::controller(&env));
 
     // Liquidation handler
     let liq_handler = env.register(LiquidationHandler, ());

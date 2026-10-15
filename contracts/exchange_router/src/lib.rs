@@ -1966,80 +1966,21 @@ mod tests {
     }
 
     #[test]
-    fn schedule_unpause_sets_timestamp() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (admin, ds_id, _, _, router_id, _) = setup(&env);
-        let client = ExchangeRouterClient::new(&env, &router_id);
+    fn schedule_unpause_records_timelocked_ledger() {
+        let w = setup();
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        let now = w.env.ledger().sequence();
 
-        let ds = DataStoreClient::new(&env, &ds_id);
-        let unpause_key = keys::unpause_time_key(&env);
+        ExchangeRouterClient::new(&w.env, &w.router).schedule_unpause();
 
-        client.schedule_unpause(&admin);
-
-        // Assert unpause timestamp is scheduled for 1 hour from now
-        let expected_time = env.ledger().timestamp() + 3600;
-        let actual_time = ds.get_u64(&unpause_key);
-        assert_eq!(actual_time, expected_time);
-    }
-
-    #[test]
-    fn execute_unpause_clears_pause_when_ready() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (admin, ds_id, _, _, router_id, _) = setup(&env);
-        let client = ExchangeRouterClient::new(&env, &router_id);
-
-        let ds = DataStoreClient::new(&env, &ds_id);
-
-        // Set pause manually first
-        client.pause(&admin);
-        assert_eq!(ds.get_bool(&keys::global_pause_key(&env)), true);
-
-        // Schedule unpause
-        client.schedule_unpause(&admin);
-        let unpause_time = ds.get_u64(&keys::unpause_time_key(&env));
-
-        // Fast forward ledger time
-        env.ledger().with_mut(|li| {
-            li.timestamp = unpause_time + 1;
-        });
-
-        client.execute_unpause();
-        assert_eq!(ds.get_bool(&keys::global_pause_key(&env)), false);
-    }
-
-    #[test]
-    fn reset_circuit_breaker_resets_volume_and_time() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (admin, ds_id, _, _, router_id, _) = setup(&env);
-        let client = ExchangeRouterClient::new(&env, &router_id);
-
-        let ds = DataStoreClient::new(&env, &ds_id);
-
-        // Set volume and time arbitrarily
-        ds.set_u128(&admin, &keys::volume_tracker_key(&env), &1000);
-        ds.set_u64(&admin, &keys::volume_time_key(&env), &1000);
-
-        client.reset_circuit_breaker(&admin);
-
-        assert_eq!(ds.get_u128(&keys::volume_tracker_key(&env)), 0);
         assert_eq!(
-            ds.get_u64(&keys::volume_time_key(&env)),
-            env.ledger().timestamp()
+            ds_c.get_u128(&scheduled_unpause_ledger_key(&w.env)),
+            (now + ExchangeRouter::UNPAUSE_TIMELOCK_LEDGERS) as u128
         );
     }
 
     #[test]
-    fn test_schedule_unpause() {
-        let w = setup();
-        let client = ExchangeRouterClient::new(&w.env, &w.router);
-        client.schedule_unpause();
-    }
-
-    #[test]
-    #[should_panic]
+    #[should_panic(expected = "Error(Contract, #6)")] // TimelockNotExpired
     fn test_execute_unpause_premature() {
         let w = setup();
         let client = ExchangeRouterClient::new(&w.env, &w.router);
@@ -2048,10 +1989,39 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_circuit_breaker() {
+    #[should_panic(expected = "Error(Contract, #7)")] // UnpauseNotScheduled
+    fn execute_unpause_without_schedule_reverts() {
+        let w = setup();
+        ExchangeRouterClient::new(&w.env, &w.router).execute_unpause();
+    }
+
+    #[test]
+    fn execute_unpause_clears_pause_when_ready() {
+        use soroban_sdk::testutils::Ledger as _;
         let w = setup();
         let client = ExchangeRouterClient::new(&w.env, &w.router);
-        client.reset_circuit_breaker(&w.market_tk);
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        ds_c.set_bool(&w.admin, &global_pause_key(&w.env), &true);
+
+        client.schedule_unpause();
+        let scheduled = ds_c.get_u128(&scheduled_unpause_ledger_key(&w.env)) as u32;
+        w.env.ledger().with_mut(|li| li.sequence_number = scheduled);
+        client.execute_unpause();
+
+        assert!(!ds_c.get_bool(&global_pause_key(&w.env)));
+        assert_eq!(ds_c.get_u128(&scheduled_unpause_ledger_key(&w.env)), 0);
+    }
+
+    #[test]
+    fn reset_circuit_breaker_unpauses_market() {
+        let w = setup();
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        let key = is_market_paused_key(&w.env, &w.market_tk);
+        ds_c.set_bool(&w.admin, &key, &true);
+
+        ExchangeRouterClient::new(&w.env, &w.router).reset_circuit_breaker(&w.market_tk);
+
+        assert!(!ds_c.get_bool(&key));
     }
 
     fn create_pending_order(

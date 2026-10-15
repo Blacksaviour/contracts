@@ -176,10 +176,7 @@ impl DataStore {
 
     pub fn get_u128(env: Env, key: BytesN<32>) -> u128 {
         let dk = DataKey::U128(key);
-        let val: u128 = env.storage().persistent().get(&dk).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .extend_ttl(&dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+        let val: u128 = read_and_bump(&env, &dk).unwrap_or(0);
         val
     }
 
@@ -188,10 +185,7 @@ impl DataStore {
         let mut results = Vec::new(&env);
         for key in keys.iter() {
             let dk = DataKey::U128(key);
-            let val: u128 = env.storage().persistent().get(&dk).unwrap_or(0);
-            env.storage()
-                .persistent()
-                .extend_ttl(&dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+            let val: u128 = read_and_bump(&env, &dk).unwrap_or(0);
             results.push_back(val);
         }
         results
@@ -236,12 +230,7 @@ impl DataStore {
     pub fn set_u128(env: Env, caller: Address, key: BytesN<32>, value: u128) -> u128 {
         caller.require_auth();
         require_controller(&env, &caller);
-        let dk = DataKey::U128(key);
-        env.storage().persistent().set(&dk, &value);
-        env.storage()
-            .persistent()
-            .extend_ttl(&dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
-        value
+        write_u128(&env, key, value)
     }
 
     /// Write-through cache variant for rarely-changing market config (#299).
@@ -277,10 +266,7 @@ impl DataStore {
     /// divergence and return the fresh persistent value, updating the cache.
     pub fn get_u128_cached(env: Env, key: BytesN<32>) -> u128 {
         let dk = DataKey::U128(key.clone());
-        let persistent_val: u128 = env.storage().persistent().get(&dk).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .extend_ttl(&dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+        let persistent_val: u128 = read_and_bump(&env, &dk).unwrap_or(0);
         env.storage()
             .instance()
             .set(&DataKey::InstanceU128(key), &persistent_val);
@@ -366,10 +352,7 @@ impl DataStore {
 
     pub fn get_i128(env: Env, key: BytesN<32>) -> i128 {
         let dk = DataKey::I128(key);
-        let val: i128 = env.storage().persistent().get(&dk).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .extend_ttl(&dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+        let val: i128 = read_and_bump(&env, &dk).unwrap_or(0);
         val
     }
 
@@ -407,10 +390,7 @@ impl DataStore {
 
     pub fn get_address(env: Env, key: BytesN<32>) -> Option<Address> {
         let dk = DataKey::Addr(key);
-        let val: Option<Address> = env.storage().persistent().get(&dk);
-        env.storage()
-            .persistent()
-            .extend_ttl(&dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+        let val: Option<Address> = read_and_bump(&env, &dk);
         val
     }
 
@@ -435,10 +415,7 @@ impl DataStore {
 
     pub fn get_bool(env: Env, key: BytesN<32>) -> bool {
         let dk = DataKey::Bool(key);
-        let val: bool = env.storage().persistent().get(&dk).unwrap_or(false);
-        env.storage()
-            .persistent()
-            .extend_ttl(&dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+        let val: bool = read_and_bump(&env, &dk).unwrap_or(false);
         val
     }
 
@@ -463,14 +440,8 @@ impl DataStore {
 
     pub fn get_bytes32(env: Env, key: BytesN<32>) -> BytesN<32> {
         let dk = DataKey::B32(key);
-        let val: BytesN<32> = env
-            .storage()
-            .persistent()
-            .get(&dk)
-            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
-        env.storage()
-            .persistent()
-            .extend_ttl(&dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+        let val: BytesN<32> =
+            read_and_bump(&env, &dk).unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
         val
     }
 
@@ -641,14 +612,7 @@ impl DataStore {
 
     pub fn contains_bytes32(env: Env, set_key: BytesN<32>, value: BytesN<32>) -> bool {
         let data_key = DataKey::B32Set(set_key);
-        let set: Vec<BytesN<32>> = env
-            .storage()
-            .persistent()
-            .get(&data_key)
-            .unwrap_or(Vec::new(&env));
-        env.storage()
-            .persistent()
-            .extend_ttl(&data_key, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+        let set: Vec<BytesN<32>> = read_and_bump(&env, &data_key).unwrap_or(Vec::new(&env));
         vec_contains_b32(&set, &value)
     }
 
@@ -686,21 +650,23 @@ impl DataStore {
 
         let count_key = gmx_keys::keeper_execution_count_key(&env, &keeper);
         let current_count = Self::get_u128(env.clone(), count_key.clone());
-        Self::set_u128(env.clone(), caller.clone(), count_key, current_count + 1);
+        // Auth was checked once above; calling the public set_u128 would
+        // re-require it and trap with Auth(ExistingValue).
+        write_u128(&env, count_key, current_count + 1);
 
         let variance = executed_price.abs_diff(expected_price);
 
         if let Some(variance_bps) = (variance * 10000).checked_div(expected_price) {
             let total_var_key = gmx_keys::keeper_total_variance_key(&env, &keeper);
             let current_total_var = Self::get_u128(env.clone(), total_var_key.clone());
-            Self::set_u128(env.clone(), caller.clone(), total_var_key, current_total_var + variance_bps);
+            write_u128(&env, total_var_key, current_total_var + variance_bps);
 
             // Slash penalty for execution variance exceeding 500 bps (5%)
             if variance_bps > 500 {
                 let slash_key = gmx_keys::keeper_slash_amount_key(&env, &keeper);
                 let current_slash = Self::get_u128(env.clone(), slash_key.clone());
                 let penalty = 100u128;
-                Self::set_u128(env.clone(), caller.clone(), slash_key, current_slash + penalty);
+                write_u128(&env, slash_key, current_slash + penalty);
 
                 env.events().publish_event(&KeeperSlashed {
                     keeper,
@@ -829,6 +795,36 @@ impl DataStore {
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Read a persistent entry and extend its TTL only if it exists.
+///
+/// `extend_ttl` on an absent key traps with `Storage(MissingValue)`, so getters
+/// that fall back to a default for never-written keys must not bump
+/// unconditionally — otherwise reading any unset value reverts the whole
+/// invocation.  Uses the `get` result instead of a separate `has` so the read
+/// costs one ledger access, not two.
+fn read_and_bump<V>(env: &Env, dk: &DataKey) -> Option<V>
+where
+    V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+{
+    let val: Option<V> = env.storage().persistent().get(dk);
+    if val.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+    }
+    val
+}
+
+/// Persist a u128 and refresh its TTL. Callers are responsible for auth.
+fn write_u128(env: &Env, key: BytesN<32>, value: u128) -> u128 {
+    let dk = DataKey::U128(key);
+    env.storage().persistent().set(&dk, &value);
+    env.storage()
+        .persistent()
+        .extend_ttl(&dk, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+    value
+}
 
 fn require_init(env: &Env) {
     if !env.storage().instance().has(&InstanceKey::Initialized) {
@@ -1070,6 +1066,28 @@ mod tests {
             client.get_address(&key).is_none(),
             "missing key must return None, not panic"
         );
+    }
+
+    /// Every defaulting getter must read a never-written key without trapping.
+    /// `extend_ttl` on an absent entry raises Storage(MissingValue), which used
+    /// to revert any invocation that read an unset flag or counter.
+    #[test]
+    fn getters_on_missing_keys_return_defaults_without_trapping() {
+        let (env, _, _, ds_id) = setup();
+        let client = DataStoreClient::new(&env, &ds_id);
+        let key = BytesN::from_array(&env, &[0xFDu8; 32]);
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        assert_eq!(client.get_u128(&key), 0);
+        assert_eq!(client.get_u128_cached(&key), 0);
+        assert_eq!(
+            client.get_u128_batch(&Vec::from_array(&env, [key.clone(), key.clone()])),
+            Vec::from_array(&env, [0u128, 0u128])
+        );
+        assert_eq!(client.get_i128(&key), 0);
+        assert!(client.get_address(&key).is_none());
+        assert!(!client.get_bool(&key));
+        assert_eq!(client.get_bytes32(&key), zero);
+        assert!(!client.contains_bytes32(&key, &zero));
     }
 
     /// Reading an address for a key that was written must return Some(addr).

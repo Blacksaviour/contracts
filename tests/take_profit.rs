@@ -95,6 +95,9 @@ fn setup() -> TestWorld {
     // Order handler
     let ord_handler = env.register(OrderHandler, ());
     OHClient::new(&env, &ord_handler).initialize(&admin, &rs, &ds, &oracle_addr, &ord_vault);
+    // Matches scripts/deploy.sh: order_handler writes to data_store and the
+    // order vault, both of which require CONTROLLER.
+    rs_c.grant_role(&admin, &ord_handler, &roles::controller(&env));
 
     // Setup market
     let ds_c = DsClient::new(&env, &ds);
@@ -121,6 +124,69 @@ fn setup() -> TestWorld {
     }
 }
 
+fn set_prices(w: &TestWorld, eth_usd: i128) {
+    OClient::new(&w.env, &w.oracle).set_prices_simple(
+        &w.keeper,
+        &soroban_sdk::Vec::from_array(
+            &w.env,
+            [
+                TokenPrice {
+                    token: w.index_tk.clone(),
+                    min: eth_usd * ONE_USD,
+                    max: eth_usd * ONE_USD,
+                },
+                TokenPrice {
+                    token: w.long_tk.clone(),
+                    min: ONE_USD,
+                    max: ONE_USD,
+                },
+            ],
+        ),
+    );
+}
+
+/// Open the $2,000 position (200 tokens of $1 collateral at ETH $2,000) that
+/// each take-profit order below closes, and seed the pool so a profitable
+/// close can be paid out. Without a real position, execute_order reverts with
+/// PositionNotFound (#642) whatever the trigger logic does.
+fn open_position(w: &TestWorld, is_long: bool) {
+    let pool = 10_000 * ONE_TOKEN;
+    StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &pool);
+    DsClient::new(&w.env, &w.ds).set_u128(
+        &w.admin,
+        &gmx_keys::pool_amount_key(&w.env, &w.market_tk, &w.long_tk),
+        &(pool as u128),
+    );
+
+    set_prices(w, 2_000);
+    StellarAssetClient::new(&w.env, &w.long_tk).transfer(
+        &w.trader,
+        &w.ord_vault,
+        &(200 * ONE_TOKEN),
+    );
+    let oh_c = OHClient::new(&w.env, &w.ord_handler);
+    let key = oh_c.create_order(&w.trader, &CreateOrderParams {
+        receiver: w.trader.clone(),
+        market: w.market_tk.clone(),
+        initial_collateral_token: w.long_tk.clone(),
+        swap_path: soroban_sdk::Vec::new(&w.env),
+        size_delta_usd: 2000 * ONE_USD,
+        collateral_delta_amount: 200 * ONE_TOKEN,
+        trigger_price: 0,
+        acceptable_price: if is_long { 2100 * ONE_USD } else { 1900 * ONE_USD },
+        execution_fee: 0,
+        min_output_amount: 0,
+        order_type: OrderType::MarketIncrease,
+        is_long,
+        expiry_ledger: None,
+        on_behalf_of: None,
+    });
+    oh_c.execute_order(&w.keeper, &key);
+    assert!(oh_c
+        .get_position(&gmx_keys::position_key(&w.env, &w.trader, &w.market_tk, &w.long_tk, is_long))
+        .is_some());
+}
+
 #[test]
 fn take_profit_not_triggered_above_trigger_price() {
     let w = setup();
@@ -131,12 +197,7 @@ fn take_profit_not_triggered_above_trigger_price() {
     // In real scenario, this would involve deposit + market increase order
     // For this test, we focus on take-profit execution logic
 
-    // Transfer collateral to vault
-    StellarAssetClient::new(&w.env, &w.long_tk).transfer(
-        &w.trader,
-        &w.ord_vault,
-        &(200 * ONE_TOKEN),
-    );
+    open_position(&w, false);
 
     // Step 2: Create take-profit decrease order for short position
     let order_key = oh_c.create_order(&w.trader, &CreateOrderParams {
@@ -176,8 +237,9 @@ fn take_profit_not_triggered_above_trigger_price() {
 
     // Step 4: Try to execute - should fail (price not low enough for short TP)
     let result = oh_c.try_execute_order(&w.keeper, &order_key);
-    assert!(
-        result.is_err(),
+    assert_eq!(
+        result,
+        Err(Ok(soroban_sdk::Error::from_contract_error(6))), // UnsatisfiedTrigger
         "Take-profit should not trigger when price is above trigger for short"
     );
 }
@@ -188,12 +250,7 @@ fn take_profit_triggers_at_exact_trigger_price() {
     let oh_c = OHClient::new(&w.env, &w.ord_handler);
     let oracle_c = OClient::new(&w.env, &w.oracle);
 
-    // Transfer collateral to vault
-    StellarAssetClient::new(&w.env, &w.long_tk).transfer(
-        &w.trader,
-        &w.ord_vault,
-        &(200 * ONE_TOKEN),
-    );
+    open_position(&w, false);
 
     // Create take-profit decrease order
     let order_key = oh_c.create_order(&w.trader, &CreateOrderParams {
@@ -245,12 +302,7 @@ fn take_profit_triggers_below_trigger_price() {
     let oh_c = OHClient::new(&w.env, &w.ord_handler);
     let oracle_c = OClient::new(&w.env, &w.oracle);
 
-    // Transfer collateral to vault
-    StellarAssetClient::new(&w.env, &w.long_tk).transfer(
-        &w.trader,
-        &w.ord_vault,
-        &(200 * ONE_TOKEN),
-    );
+    open_position(&w, false);
 
     // Create take-profit decrease order
     let order_key = oh_c.create_order(&w.trader, &CreateOrderParams {
@@ -302,12 +354,7 @@ fn take_profit_slippage_protection_rejects_worse_price() {
     let oh_c = OHClient::new(&w.env, &w.ord_handler);
     let oracle_c = OClient::new(&w.env, &w.oracle);
 
-    // Transfer collateral to vault
-    StellarAssetClient::new(&w.env, &w.long_tk).transfer(
-        &w.trader,
-        &w.ord_vault,
-        &(200 * ONE_TOKEN),
-    );
+    open_position(&w, false);
 
     // Create take-profit order with tight acceptable price
     let order_key = oh_c.create_order(&w.trader, &CreateOrderParams {
@@ -347,8 +394,13 @@ fn take_profit_slippage_protection_rejects_worse_price() {
 
     // Execute order - should fail due to slippage
     let result = oh_c.try_execute_order(&w.keeper, &order_key);
-    assert!(
-        result.is_err(),
+    assert_eq!(
+        result,
+        // UnsatisfiedTrigger: with trigger 1,800 below acceptable 1,820, any
+        // price that passes the trigger also passes slippage, so the trigger
+        // check is what rejects 1,830. Slippage itself is covered by
+        // stop_loss_slippage_protection_rejects_worse_price.
+        Err(Ok(soroban_sdk::Error::from_contract_error(6))),
         "Take-profit should revert when execution price worse than acceptable"
     );
 }
@@ -359,12 +411,7 @@ fn take_profit_long_position_triggers_above_entry_price() {
     let oh_c = OHClient::new(&w.env, &w.ord_handler);
     let oracle_c = OClient::new(&w.env, &w.oracle);
 
-    // Transfer collateral to vault
-    StellarAssetClient::new(&w.env, &w.long_tk).transfer(
-        &w.trader,
-        &w.ord_vault,
-        &(200 * ONE_TOKEN),
-    );
+    open_position(&w, true);
 
     // Create take-profit for LONG position (trigger when price rises)
     let order_key = oh_c.create_order(&w.trader, &CreateOrderParams {
@@ -404,8 +451,9 @@ fn take_profit_long_position_triggers_above_entry_price() {
 
     // Should not trigger yet
     let result = oh_c.try_execute_order(&w.keeper, &order_key);
-    assert!(
-        result.is_err(),
+    assert_eq!(
+        result,
+        Err(Ok(soroban_sdk::Error::from_contract_error(6))), // UnsatisfiedTrigger
         "Take-profit for long should not trigger below trigger price"
     );
 

@@ -2,14 +2,14 @@
 
 .PHONY: test test-one test-snap testnet-smoke
 
-test:
+test: test-wasm
 	cargo test --workspace
 
-test-one:
+test-one: test-wasm
 	@test -n "$(PACKAGE)" || { printf '%s\n' 'Usage: make test-one PACKAGE=deposit-handler'; exit 1; }
 	cargo test -p "$(PACKAGE)"
 
-test-snap:
+test-snap: test-wasm
 	INSTA_UPDATE=always cargo test --workspace
 
 testnet-smoke: preflight

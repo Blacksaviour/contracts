@@ -298,6 +298,14 @@ fn keeper_executes_orders_on_two_markets_in_same_ledger() {
     let btc_pool = ds_c.get_u128(&pool_amount_key(env, &w.btc_market, &w.usdc));
     assert!(eth_pool > 0, "ETH/USD pool must hold collateral");
     assert!(btc_pool > 0, "BTC/USD pool must hold collateral");
-    // Pools are segregated — neither should equal the other
-    assert_ne!(eth_pool, btc_pool, "pool amounts should differ (different collateral sizes)");
+    // Position collateral is tracked in collateral_sum, not pool_amount
+    // (#531 — the pool only receives LP fees), so segregation shows up there:
+    // each market's collateral_sum must equal exactly its own position's
+    // collateral, with nothing leaking across markets.
+    let eth_col_sum = ds_c.get_u128(&gmx_keys::collateral_sum_key(env, &w.eth_market, &w.usdc, true));
+    let btc_col_sum = ds_c.get_u128(&gmx_keys::collateral_sum_key(env, &w.btc_market, &w.usdc, false));
+    assert_eq!(eth_col_sum as i128, eth_pos.unwrap().collateral_amount);
+    assert_eq!(btc_col_sum as i128, btc_pos.unwrap().collateral_amount);
+    assert_eq!(ds_c.get_u128(&gmx_keys::collateral_sum_key(env, &w.eth_market, &w.usdc, false)), 0);
+    assert_eq!(ds_c.get_u128(&gmx_keys::collateral_sum_key(env, &w.btc_market, &w.usdc, true)), 0);
 }

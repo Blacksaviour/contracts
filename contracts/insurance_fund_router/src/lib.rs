@@ -323,9 +323,9 @@ mod tests {
     use data_store::{DataStore, DataStoreClient as DsClient};
     use gmx_keys::roles;
     use role_store::{RoleStore, RoleStoreClient as RsClient};
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events as _};
     use soroban_sdk::token::StellarAssetClient;
-    use soroban_sdk::{symbol_short, IntoVal, Val, Vec as SdkVec};
+    use soroban_sdk::Event as _;
 
     struct World {
         env: Env,
@@ -485,17 +485,16 @@ mod tests {
         assert_eq!(split.treasury_share, 1_000);
 
         // The transfer to the treasury also emits the token's own SEP-41 transfer
-        // event in the same call, so check containment rather than exact equality.
-        let events = w.env.events().all();
-        let expected_topics: SdkVec<Val> = (symbol_short!("if_tpen"),).into_val(&w.env);
-        let expected_payload = TreasuryShareRouted {
+        // event in the same call, so look only at the router's own events.
+        let expected = TreasuryShareRouted {
             market,
             token: w.token.clone(),
             treasury,
             treasury_share: 1_000,
         };
-        assert!(
-            events.contains((w.router.clone(), expected_topics, expected_payload.into_val(&w.env))),
+        assert_eq!(
+            w.env.events().all().filter_by_contract(&w.router),
+            [expected.to_xdr(&w.env, &w.router)],
             "TreasuryShareRouted must be published even when insurance_share is 0"
         );
     }

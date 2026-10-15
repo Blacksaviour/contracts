@@ -24,14 +24,14 @@ Run in this order. Every step must exit zero.
 ```bash
 make check          # cargo check --workspace
 make lint           # cargo clippy --workspace -- -D warnings
-cargo clippy --workspace --all-targets -- -D warnings
-make test           # cargo test --workspace
+make lint-all       # builds test WASM fixtures, then cargo clippy --workspace --all-targets -- -D warnings
+make test           # builds test WASM fixtures, then cargo test --workspace
 make build          # stellar contract build  (all 23 contracts → WASM)
 ```
 
-Two of these are not in the Makefile by accident of history, and matter most:
+Two of these matter most:
 
-- **`cargo clippy --workspace --all-targets`** — plain `make lint` does *not* compile `#[cfg(test)]`
+- **`make lint-all`** (`cargo clippy --workspace --all-targets`) — plain `make lint` does *not* compile `#[cfg(test)]`
   modules or `tests/` directories. Without `--all-targets`, test code is invisible to static checking
   and can rot for weeks while every check reports green.
 - **`make build`** — `cargo check` and `cargo test` compile for the host target. Contract-macro
@@ -100,16 +100,14 @@ Do not treat a green CI run as evidence your change is sound. As currently confi
 
 | Workflow | Runs | Covers |
 |---|---|---|
-| `lint.yml` | `cargo fmt --check`, `cargo clippy --workspace` | Library targets only — **not test code** |
-| `wasm-size.yml` | `cargo build --target ... --release` | Build + size budget |
+| `lint.yml` | `cargo fmt --check`, `cargo clippy --workspace --all-targets` | Library and test code |
+| `test.yml` | `cargo build --target wasm32v1-none --release`, `cargo test --workspace` | WASM build + all tests |
+| `wasm-size.yml` | `cargo build --target ... --release` | Build + size budget (PR only — compares against base) |
 | `auth-audit.yml` | `docs/auth-audit.md` sync check | Docs only |
 
-All three trigger on `pull_request` only. **Nothing verifies `main` after a merge**, so two
-individually-green PRs can merge into a broken branch with no signal. There is no `cargo test` job at
-all.
-
-If you are asked to improve CI, the highest-value changes are: add `push: [main]` triggers, add
-`--all-targets` to the clippy invocation, and add a `cargo test --workspace` job.
+`lint.yml`, `test.yml` and `auth-audit.yml` run on both `pull_request` and `push` to `main`.
+CI still does not run `stellar contract build`, deploy, or `make testnet-smoke` — verify deploy-path
+changes locally as described above.
 
 ---
 

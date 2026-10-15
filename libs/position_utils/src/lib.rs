@@ -1218,18 +1218,21 @@ mod tests {
         );
     }
 
-    /// Bug #2 — PnL must not mask a collateral shortfall in the min_collateral_factor check.
+    /// PnL is folded into the min_collateral_factor check (#406, see
+    /// docs/liquidation-flow.md): `remaining = collateral - fees + pnl`.
     ///
     /// Setup: size=$10 000, collateral=$500 gross, pending borrowing fees≈$420
     ///   → net_collateral = $500 - $420 = $80
     ///   → min_collateral_factor = 1% → min_required = $100
-    ///   → net_collateral ($80) < min_required ($100) → LIQUIDATABLE
     ///
-    /// The position also has +$100 unrealised PnL. Before this fix, the old code
-    /// computed `remaining = $80 + $100 = $180 ≥ $100` and returned false (not
-    /// liquidatable). The fixed code must return true.
+    /// At a flat price, remaining ($80) < $100 → LIQUIDATABLE: fees alone can
+    /// push a position under the floor. After a +2% move, PnL ≈ +$200 and
+    /// remaining ≈ $280 ≥ $100 → NOT liquidatable.
+    ///
+    /// This test originally asserted the pre-#406 rule (PnL ignored in the
+    /// primary branch); #406 deliberately changed that and left the test stale.
     #[test]
-    fn pnl_does_not_mask_collateral_shortfall_below_min_factor() {
+    fn pnl_is_folded_into_min_collateral_factor_check() {
         let w = setup();
         let ds_c = DsClient::new(&w.env, &w.ds);
         let market = make_market(&w);
@@ -1269,17 +1272,25 @@ mod tests {
         position.size_in_tokens = size_in_tokens;
         position.borrowing_factor = 0; // opened at cum=0
 
-        // Price advances 2% → unrealised PnL ≈ +$200 (should NOT save the position)
-        let current_price = 2_040 * FP; // slight profit
+        // Flat price → PnL = 0, remaining = $80 < $100 → liquidatable.
+        let flat = PriceProps {
+            min: collateral_price,
+            max: collateral_price,
+        };
+        assert!(
+            is_liquidatable(&w.env, &w.ds, &position, &market, collateral_price, &flat),
+            "fees alone pushing net collateral below min_collateral_factor must be liquidatable"
+        );
+
+        // Price advances 2% → unrealised PnL ≈ +$200 → remaining ≈ $280 ≥ $100.
+        let current_price = 2_040 * FP;
         let price_props = PriceProps {
             min: current_price,
             max: current_price,
         };
-
-        // Fixed: net_collateral < min_required → must be liquidatable
         assert!(
-            is_liquidatable(&w.env, &w.ds, &position, &market, collateral_price, &price_props),
-            "position with net_collateral below min_collateral_factor must be liquidatable even with positive PnL"
+            !is_liquidatable(&w.env, &w.ds, &position, &market, collateral_price, &price_props),
+            "PnL counts toward remaining collateral (#406)"
         );
     }
 

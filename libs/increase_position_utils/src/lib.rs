@@ -893,9 +893,12 @@ mod tests {
         );
     }
 
-    /// A position that would push total OI over the configured cap must revert.
+    /// A position that pushes total OI over the configured cap must fail the
+    /// cap check. `increase_position` only applies the OI delta; the cap is
+    /// enforced by order_handler right after (issue #450), so this asserts the
+    /// exact check it runs. A bare `#[should_panic]` here used to pass on an
+    /// unrelated storage trap without ever reaching the cap.
     #[test]
-    #[should_panic]
     fn oi_cap_over_cap_reverts() {
         let w = setup();
         let fp = FLOAT_PRECISION;
@@ -921,13 +924,18 @@ mod tests {
             max: index_price,
         };
 
-        // Attempt to open a position that exceeds the cap — must revert
+        // Open a position that exceeds the cap, then run order_handler's cap check.
         w.env.as_contract(&w.admin, || {
             increase_position(
                 &w.env,
                 &open_params(&w, &market, &price_props, cap as i128 + fp, index_price),
             );
         });
+        assert_eq!(
+            gmx_market_utils::validate_open_interest(&w.env, &w.ds, &market, true),
+            Err(gmx_market_utils::Error::MaxOpenInterestExceeded),
+            "OI above the long cap must fail validation"
+        );
     }
 
     /// Cap is per-side: a long OI cap does not affect short positions.
