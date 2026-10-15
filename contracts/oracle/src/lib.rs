@@ -426,15 +426,23 @@ impl Oracle {
         }
     }
 
-    /// Require that the stored price for `token` was signed for `expected_ledger_seq`.
-    /// Panics with `StalePrice` if the stored ledger sequence differs.
+    /// Require that the stored price for `token` is fresh relative to
+    /// `expected_ledger_seq` (callers pass the current ledger): it must have
+    /// been signed no later than that ledger and at most
+    /// `PRICE_FRESHNESS_WINDOW` ledgers before it.
+    ///
+    /// Exact equality (the previous rule) is unsatisfiable: the keeper signs at
+    /// the last closed ledger L, `set_prices` lands in L+1 or later, and
+    /// `execute_*` runs in a further transaction, so every deposit/withdrawal
+    /// reverted with `StalePrice` (SO4-Markets/so4-oracle#1205).
+    /// Panics with `StalePrice` otherwise.
     pub fn require_price_fresh(env: Env, token: Address, expected_ledger_seq: u32) -> PriceProps {
         let stored: StoredPrice = env
             .storage()
             .temporary()
             .get::<TempKey, StoredPrice>(&TempKey::Price(token))
             .unwrap_or_else(|| panic_with_error!(&env, Error::PriceNotFound));
-        if stored.ledger_seq != expected_ledger_seq {
+        if is_seq_stale(expected_ledger_seq, stored.ledger_seq, PRICE_FRESHNESS_WINDOW) {
             panic_with_error!(&env, Error::StalePrice);
         }
         PriceProps {
@@ -648,6 +656,13 @@ impl Oracle {
 /// Casts both values to u64 so the subtraction is always safe: when `submitted > current`
 /// (which happens after a u32 sequence wrap-around where a pre-wrap sequence numerically
 /// exceeds the post-wrap current) the first branch triggers and we treat it as stale.
+/// Max ledgers between the price's signing ledger and its use in
+/// `require_price_fresh` (~100s at 5s/ledger). Covers sign-at-L, `set_prices`
+/// confirmation, the keeper's post-confirmation delay and a cycle's sequential
+/// executions (50s cycle cap), while staying far tighter than the 60-ledger
+/// `set_prices` acceptance window (SO4-Markets/so4-oracle#1205).
+pub const PRICE_FRESHNESS_WINDOW: u32 = 20;
+
 fn is_seq_stale(current: u32, submitted: u32, window: u32) -> bool {
     let c = current as u64;
     let s = submitted as u64;
