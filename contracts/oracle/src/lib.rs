@@ -1093,6 +1093,35 @@ mod tests {
         client.clear_prices(&admin, &tokens);
     }
 
+    // ── so4-oracle#1205: require_price_fresh uses a window, not equality ─────
+
+    /// The keeper signs at closed ledger L; executions land a few ledgers later.
+    #[test]
+    fn price_freshness_window_accepts_keeper_flow_and_rejects_old_or_future() {
+        let signed_at = 1_000;
+        // set_prices lands in L+1, executions follow within the window.
+        for current in [
+            signed_at,
+            signed_at + 1,
+            signed_at + 5,
+            signed_at + PRICE_FRESHNESS_WINDOW,
+        ] {
+            assert!(
+                !is_seq_stale(current, signed_at, PRICE_FRESHNESS_WINDOW),
+                "price signed at {signed_at} must be fresh at {current}"
+            );
+        }
+        assert!(is_seq_stale(
+            signed_at + PRICE_FRESHNESS_WINDOW + 1,
+            signed_at,
+            PRICE_FRESHNESS_WINDOW
+        ));
+        // A price signed for a future ledger is never fresh.
+        assert!(is_seq_stale(signed_at, signed_at + 1, PRICE_FRESHNESS_WINDOW));
+        // Stays tighter than the set_prices acceptance window.
+        assert!(PRICE_FRESHNESS_WINDOW < 60);
+    }
+
     // ── Issue #172: ledger sequence wrap-around staleness ─────────────────────
 
     /// Post-wrap scenario: current_seq = 1, submitted = u32::MAX.
