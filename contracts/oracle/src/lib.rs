@@ -148,7 +148,9 @@ trait IDataStore {
     fn get_address_set_count(env: Env, set_key: BytesN<32>) -> u32;
     fn get_address_set_at(env: Env, set_key: BytesN<32>, start: u32, end: u32) -> Vec<Address>;
     fn set_bool(env: Env, caller: Address, key: BytesN<32>, value: bool) -> bool;
-    fn set_bytes32(env: Env, caller: Address, key: BytesN<32>, value: BytesN<32>);
+    // Must match data_store's return type: the client decodes the result, and a
+    // `()` declaration traps with ConversionError on every call.
+    fn set_bytes32(env: Env, caller: Address, key: BytesN<32>, value: BytesN<32>) -> BytesN<32>;
     fn add_address_to_set(env: Env, caller: Address, set_key: BytesN<32>, value: Address);
     fn set_u128(env: Env, caller: Address, key: BytesN<32>, value: u128) -> u128;
 }
@@ -1309,7 +1311,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "HostError: Error(Value, InvalidInput)")] // or whatever panic comes from price not found
+    #[should_panic(expected = "Error(Contract, #6)")] // PriceNotFound
     fn clear_prices_actually_clears() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1338,7 +1340,7 @@ mod tests {
     fn get_stable_price_returns_none_on_overflow() {
         let env = Env::default();
         env.mock_all_auths();
-        let (admin, ds_id, _, oracle_id) = setup(&env);
+        let (admin, _, ds_id, oracle_id) = setup(&env);
         let client = OracleClient::new(&env, &oracle_id);
 
         let token = Address::generate(&env);
@@ -1355,7 +1357,7 @@ mod tests {
     fn get_price_with_stable_fallback_uses_primary_on_stable_overflow() {
         let env = Env::default();
         env.mock_all_auths();
-        let (admin, ds_id, _, oracle_id) = setup(&env);
+        let (admin, _, ds_id, oracle_id) = setup(&env);
         let client = OracleClient::new(&env, &oracle_id);
 
         let token = Address::generate(&env);
