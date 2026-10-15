@@ -97,6 +97,9 @@ fn setup() -> TestWorld {
     // Order handler
     let ord_handler = env.register(OrderHandler, ());
     OHClient::new(&env, &ord_handler).initialize(&admin, &rs, &ds, &oracle_addr, &ord_vault);
+    // Matches scripts/deploy.sh: order_handler writes to data_store and the
+    // order vault, both of which require CONTROLLER.
+    rs_c.grant_role(&admin, &ord_handler, &roles::controller(&env));
 
     // Setup market
     let ds_c = DsClient::new(&env, &ds);
@@ -123,6 +126,60 @@ fn setup() -> TestWorld {
     }
 }
 
+fn set_prices(w: &TestWorld, eth_usd: i128) {
+    OClient::new(&w.env, &w.oracle).set_prices_simple(
+        &w.keeper,
+        &soroban_sdk::Vec::from_array(
+            &w.env,
+            [
+                TokenPrice {
+                    token: w.index_tk.clone(),
+                    min: eth_usd * ONE_USD,
+                    max: eth_usd * ONE_USD,
+                },
+                TokenPrice {
+                    token: w.long_tk.clone(),
+                    min: ONE_USD,
+                    max: ONE_USD,
+                },
+            ],
+        ),
+    );
+}
+
+/// Open the $2,000 long (200 tokens of $1 collateral at ETH $2,000) that each
+/// stop-loss order below closes. Without a real position, execute_order
+/// reverts with PositionNotFound (#642) whatever the trigger logic does.
+fn open_long(w: &TestWorld) {
+    set_prices(w, 2_000);
+    StellarAssetClient::new(&w.env, &w.long_tk).transfer(
+        &w.trader,
+        &w.ord_vault,
+        &(200 * ONE_TOKEN),
+    );
+    let oh_c = OHClient::new(&w.env, &w.ord_handler);
+    let key = oh_c.create_order(&w.trader, &CreateOrderParams {
+        receiver: w.trader.clone(),
+        market: w.market_tk.clone(),
+        initial_collateral_token: w.long_tk.clone(),
+        swap_path: soroban_sdk::Vec::new(&w.env),
+        size_delta_usd: 2000 * ONE_USD,
+        collateral_delta_amount: 200 * ONE_TOKEN,
+        trigger_price: 0,
+        acceptable_price: 2100 * ONE_USD,
+        execution_fee: 0,
+        min_output_amount: 0,
+        order_type: OrderType::MarketIncrease,
+        is_long: true,
+        expiry_ledger: None,
+        on_behalf_of: None,
+    });
+    oh_c.execute_order(&w.keeper, &key);
+    assert!(oh_c
+        .get_position(&position_key(&w.env, &w.trader, &w.market_tk, &w.long_tk, true))
+        .is_some());
+}
+
 #[test]
 fn stop_loss_not_triggered_above_trigger_price() {
     let w = setup();
@@ -133,12 +190,7 @@ fn stop_loss_not_triggered_above_trigger_price() {
     // In real scenario, this would involve deposit + market increase order
     // For this test, we focus on stop-loss execution logic
 
-    // Transfer collateral to vault
-    StellarAssetClient::new(&w.env, &w.long_tk).transfer(
-        &w.trader,
-        &w.ord_vault,
-        &(200 * ONE_TOKEN),
-    );
+    open_long(&w);
 
     // Step 2: Create stop-loss decrease order
     let order_key = oh_c.create_order(&w.trader, &CreateOrderParams {
@@ -178,7 +230,11 @@ fn stop_loss_not_triggered_above_trigger_price() {
 
     // Step 4: Try to execute - should fail (price not low enough)
     let result = oh_c.try_execute_order(&w.keeper, &order_key);
-    assert!(result.is_err(), "Order should not trigger above trigger price");
+    assert_eq!(
+        result,
+        Err(Ok(soroban_sdk::Error::from_contract_error(6))), // UnsatisfiedTrigger
+        "Order should not trigger above trigger price"
+    );
 }
 
 #[test]
@@ -188,12 +244,7 @@ fn stop_loss_triggers_at_exact_trigger_price() {
     let oracle_c = OClient::new(&w.env, &w.oracle);
     let _ds_c = DsClient::new(&w.env, &w.ds);
 
-    // Transfer collateral to vault
-    StellarAssetClient::new(&w.env, &w.long_tk).transfer(
-        &w.trader,
-        &w.ord_vault,
-        &(200 * ONE_TOKEN),
-    );
+    open_long(&w);
 
     // Create stop-loss decrease order
     let order_key = oh_c.create_order(&w.trader, &CreateOrderParams {
@@ -245,12 +296,7 @@ fn stop_loss_triggers_below_trigger_price() {
     let oh_c = OHClient::new(&w.env, &w.ord_handler);
     let oracle_c = OClient::new(&w.env, &w.oracle);
 
-    // Transfer collateral to vault
-    StellarAssetClient::new(&w.env, &w.long_tk).transfer(
-        &w.trader,
-        &w.ord_vault,
-        &(200 * ONE_TOKEN),
-    );
+    open_long(&w);
 
     // Create stop-loss decrease order
     let order_key = oh_c.create_order(&w.trader, &CreateOrderParams {
@@ -299,12 +345,7 @@ fn stop_loss_slippage_protection_rejects_worse_price() {
     let oh_c = OHClient::new(&w.env, &w.ord_handler);
     let oracle_c = OClient::new(&w.env, &w.oracle);
 
-    // Transfer collateral to vault
-    StellarAssetClient::new(&w.env, &w.long_tk).transfer(
-        &w.trader,
-        &w.ord_vault,
-        &(200 * ONE_TOKEN),
-    );
+    open_long(&w);
 
     // Create stop-loss order with tight acceptable price
     let order_key = oh_c.create_order(&w.trader, &CreateOrderParams {
@@ -344,8 +385,9 @@ fn stop_loss_slippage_protection_rejects_worse_price() {
 
     // Execute order - should fail due to slippage
     let result = oh_c.try_execute_order(&w.keeper, &order_key);
-    assert!(
-        result.is_err(),
+    assert_eq!(
+        result,
+        Err(Ok(soroban_sdk::Error::from_contract_error(1))), // execution price below acceptable
         "Order should revert when price exceeds acceptable slippage"
     );
 }

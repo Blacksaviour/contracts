@@ -48,6 +48,8 @@ const ONE_USD: i128 = FLOAT_PRECISION;
 // create_market_duplicate_token_triple_panics in
 // contracts/market_factory/src/lib.rs), so this is the first place in the
 // workspace that exercises create_market's real deploy path.
+// Generated client mirrors market_token's 8-argument initialize.
+#[allow(clippy::too_many_arguments)]
 mod market_token_wasm {
     soroban_sdk::contractimport!(file = "../target/wasm32v1-none/release/market_token.wasm");
 }

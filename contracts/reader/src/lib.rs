@@ -1921,6 +1921,8 @@ mod tests {
         let rs = env.register(RoleStore, ());
         RsClient::new(&env, &rs).initialize(&admin);
         RsClient::new(&env, &rs).grant_role(&admin, &admin, &roles::controller(&env));
+        // Admin publishes oracle prices below, which requires ORDER_KEEPER.
+        RsClient::new(&env, &rs).grant_role(&admin, &admin, &roles::order_keeper(&env));
         RsClient::new(&env, &rs).grant_role(&admin, &admin, &roles::order_keeper(&env));
 
         let ds = env.register(DataStore, ());
@@ -1989,6 +1991,8 @@ mod tests {
                 .persistent()
                 .set(&PositionStorageKey::Position(pk.clone()), &position);
         });
+        // The reader scans data_store's global position list.
+        ds_c.add_bytes32_to_set(&admin, &position_list_key(&env), &pk);
 
         let result = ReaderClient::new(&env, &reader)
             .get_adl_eligible_positions(&ds, &oracle, &ord_handler, &market_tk, &true, &10);
@@ -2103,11 +2107,11 @@ mod tests {
         let owners: SdkVec<Address> =
             SdkVec::from_array(&env, [result.get(0).unwrap().owner, result.get(1).unwrap().owner]);
         assert!(
-            owners.contains(&traders.get(2).unwrap()),
+            owners.contains(traders.get(2).unwrap()),
             "the highest-ratio position (scanned last) must be included"
         );
         assert!(
-            !owners.contains(&traders.get(0).unwrap()),
+            !owners.contains(traders.get(0).unwrap()),
             "the lowest-ratio position must be excluded once the top 2 by ratio are kept"
         );
     }
@@ -2123,6 +2127,8 @@ mod tests {
         let rs = env.register(RoleStore, ());
         RsClient::new(&env, &rs).initialize(&admin);
         RsClient::new(&env, &rs).grant_role(&admin, &admin, &roles::controller(&env));
+        // Admin publishes oracle prices below, which requires ORDER_KEEPER.
+        RsClient::new(&env, &rs).grant_role(&admin, &admin, &roles::order_keeper(&env));
 
         let ds = env.register(DataStore, ());
         DsClient::new(&env, &ds).initialize(&admin, &rs);
@@ -2450,6 +2456,13 @@ mod tests {
         ds_c.set_u128(&w.admin, &open_interest_key(env, &market_tk, &long_tk, true), &(50_000 * fp as u128));
         ds_c.set_u128(&w.admin, &open_interest_key(env, &market_tk, &short_tk, false), &(1_000 * fp as u128));
 
+        // The impact itself has to be configured: with no swap impact factor,
+        // impact is 0 and the swap trivially succeeds. Linear exponent and a
+        // 100% negative factor: the pool imbalance grows from $9,990 to
+        // $19,990, so impact ≈ -$10,000 against $5,000 in → output ≤ 0.
+        ds_c.set_u128(&w.admin, &gmx_keys::swap_impact_factor_key(env, &market_tk, false), &(fp as u128));
+        ds_c.set_u128(&w.admin, &gmx_keys::swap_impact_exponent_factor_key(env, &market_tk), &(fp as u128));
+
         let price = fp;
         OClient::new(env, &w.oracle).set_prices_simple(
             &w.admin,
@@ -2509,6 +2522,8 @@ mod tests {
         let rs = env.register(RoleStore, ());
         RsClient::new(&env, &rs).initialize(&admin);
         RsClient::new(&env, &rs).grant_role(&admin, &admin, &roles::controller(&env));
+        // Admin publishes oracle prices below, which requires ORDER_KEEPER.
+        RsClient::new(&env, &rs).grant_role(&admin, &admin, &roles::order_keeper(&env));
         RsClient::new(&env, &rs).grant_role(&admin, &admin, &roles::order_keeper(&env));
 
         let ds = env.register(DataStore, ());
@@ -2593,9 +2608,21 @@ mod tests {
         let pk1 = position_key(&env, &trader1, &market_tk, &long_tk, true);
         let pk2 = position_key(&env, &trader2, &market_tk, &long_tk, true);
         env.as_contract(&ord_handler, || {
-            env.storage().persistent().set(&PositionStorageKey::Position(pk1), &pos1);
-            env.storage().persistent().set(&PositionStorageKey::Position(pk2), &pos2);
+            env.storage().persistent().set(&PositionStorageKey::Position(pk1.clone()), &pos1);
+            env.storage().persistent().set(&PositionStorageKey::Position(pk2.clone()), &pos2);
         });
+        // The reader scans data_store's global position list, so register both.
+        let pos_list = position_list_key(&env);
+        DsClient::new(&env, &ds).add_bytes32_to_set(&admin, &pos_list, &pk1);
+        DsClient::new(&env, &ds).add_bytes32_to_set(&admin, &pos_list, &pk2);
+        // 1% min collateral factor → $100 required on $10k: pos1 ($500) is
+        // healthy, pos2 ($10) is liquidatable. Without it the rule is
+        // `remaining < 0`, which neither break-even position meets.
+        DsClient::new(&env, &ds).set_u128(
+            &admin,
+            &gmx_keys::min_collateral_factor_key(&env, &market_tk),
+            &((fp / 100) as u128),
+        );
 
         let result = ReaderClient::new(&env, &reader)
             .get_liquidatable_positions(&ds, &oracle, &ord_handler, &market_tk, &true, &10, &0);

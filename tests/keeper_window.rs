@@ -203,6 +203,9 @@ fn seed_pool(w: &TestWorld) {
 ///
 /// Used to trigger `record_keeper_activity` so the heartbeat ledger is stamped.
 fn execute_order_at_current_ledger(w: &TestWorld) -> OHClient<'_> {
+    // Oracle prices live in temporary storage and expire across the ledger
+    // jumps these tests make, so publish them at the execution ledger.
+    set_prices(w, 2_000);
     let oh_c = OHClient::new(&w.env, &w.ord_handler);
     let trader = Address::generate(&w.env);
     let collateral = 5 * ONE_TOKEN;

@@ -1257,16 +1257,22 @@ impl OrderHandler {
                     &order.collateral_delta_amount,
                 );
 
-                // Issue #204: apply fee tier based on 30-day rolling volume
-                let effective_fee_factor =
+                // Issue #204: apply fee tier based on 30-day rolling volume.
+                // Only override the market's base fee when a tier actually
+                // applies — overriding with 0 when none qualifies zeroed the
+                // opening fee for every trader on markets without tiers.
+                let tier_fee_factor =
                     resolve_fee_tier(&env, &data_store, &handler, &order.account, &market.market_token, order.size_delta_usd);
                 let fee_key_pos = position_fee_factor_key(&env, &market.market_token, true);
                 let fee_key_neg = position_fee_factor_key(&env, &market.market_token, false);
                 let ds_client = DataStoreClient::new(&env, &data_store);
-                let original_fee_pos = ds_client.get_u128(&fee_key_pos);
-                let original_fee_neg = ds_client.get_u128(&fee_key_neg);
-                ds_client.set_u128(&handler, &fee_key_pos, &effective_fee_factor);
-                ds_client.set_u128(&handler, &fee_key_neg, &effective_fee_factor);
+                let original_fees = tier_fee_factor.map(|effective_fee_factor| {
+                    let original_fee_pos = ds_client.get_u128(&fee_key_pos);
+                    let original_fee_neg = ds_client.get_u128(&fee_key_neg);
+                    ds_client.set_u128(&handler, &fee_key_pos, &effective_fee_factor);
+                    ds_client.set_u128(&handler, &fee_key_neg, &effective_fee_factor);
+                    (original_fee_pos, original_fee_neg)
+                });
 
                 // Issue #205: snapshot pre-increase state for event
                 let pos_key = position_key(&env, &order.account, &market.market_token, &order.initial_collateral_token, order.is_long);
@@ -1294,8 +1300,10 @@ impl OrderHandler {
                 );
 
                 // Restore original fee factors
-                ds_client.set_u128(&handler, &fee_key_pos, &original_fee_pos);
-                ds_client.set_u128(&handler, &fee_key_neg, &original_fee_neg);
+                if let Some((original_fee_pos, original_fee_neg)) = original_fees {
+                    ds_client.set_u128(&handler, &fee_key_pos, &original_fee_pos);
+                    ds_client.set_u128(&handler, &fee_key_neg, &original_fee_neg);
+                }
 
                 // Issue #206: enforce max leverage. max_leverage_key is stored
                 // FLOAT_PRECISION-scaled (issue #625) — every configuration
@@ -2191,7 +2199,7 @@ fn resolve_fee_tier(
     account: &Address,
     market: &Address,
     size_delta_usd: i128,
-) -> u128 {
+) -> Option<u128> {
     const WINDOW_LEDGERS: u32 = 518_400; // 30 days × 24h × 720 ledgers/h
     let ds = DataStoreClient::new(env, data_store);
 
@@ -2210,8 +2218,9 @@ fn resolve_fee_tier(
         ds.apply_delta_to_u128(caller, &vol_key, &size_delta_usd)
     };
 
-    // Walk tiers 0-4, return best qualifying fee
-    let mut best_fee: u128 = 0;
+    // Walk tiers 0-4, return best qualifying fee (None if no tier qualifies,
+    // so the caller keeps the market's base position fee).
+    let mut best_fee: Option<u128> = None;
     for tier in 0u32..5u32 {
         let thresh_key = fee_tier_volume_threshold_key(env, market, tier);
         let threshold = ds.get_u128(&thresh_key);
@@ -2222,7 +2231,7 @@ fn resolve_fee_tier(
             let factor_key = fee_tier_position_fee_factor_key(env, market, tier);
             let fee_factor = ds.get_u128(&factor_key);
             if fee_factor > 0 {
-                best_fee = fee_factor;
+                best_fee = Some(fee_factor);
             }
         }
     }
@@ -4130,6 +4139,9 @@ mod tests {
         set_prices(&w, 2_000 * fp);
 
         w.env.ledger().set_sequence_number(500);
+        // Oracle prices live in temporary storage; re-publish after the jump
+        // or they expire and execute_order reverts with PriceNotFound.
+        set_prices(&w, 2_000 * fp);
         let (hc, key) = create_increase_order(&w, OrderType::MarketIncrease, 0);
         hc.execute_order(&w.keeper, &key);
 
@@ -4155,6 +4167,9 @@ mod tests {
 
         // Keeper executes at ledger 1000 → activity recorded.
         w.env.ledger().set_sequence_number(1000);
+        // Oracle prices live in temporary storage; re-publish after the jump
+        // or they expire and execute_order reverts with PriceNotFound.
+        set_prices(&w, 2_000 * fp);
         let (_, key) = create_increase_order(&w, OrderType::MarketIncrease, 0);
         hc.execute_order(&w.keeper, &key);
         assert!(!hc
@@ -4197,6 +4212,9 @@ mod tests {
         hc.set_keeper_heartbeat_timeout(&w.admin, &order_keeper_role, &100u64);
 
         w.env.ledger().set_sequence_number(2000);
+        // Oracle prices live in temporary storage; re-publish after the jump
+        // or they expire and execute_order reverts with PriceNotFound.
+        set_prices(&w, 2_000 * fp);
         let (_, key) = create_increase_order(&w, OrderType::MarketIncrease, 0);
         hc.execute_order(&w.keeper, &key);
 

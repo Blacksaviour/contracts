@@ -1302,42 +1302,18 @@ mod tests {
     }
 
     #[test]
-    fn auto_compound_toggles_correctly() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (admin, ds_id, _, _, fee_handler_id) = setup(&env);
-        let client = FeeHandlerClient::new(&env, &fee_handler_id);
-
-        let ds = DataStoreClient::new(&env, &ds_id);
-
-        // Initially false or default
-        assert_eq!(client.is_auto_compound(&admin), false);
-
-        client.set_auto_compound(&admin, &true);
-        assert_eq!(client.is_auto_compound(&admin), true);
-
-        client.set_auto_compound(&admin, &false);
-        assert_eq!(client.is_auto_compound(&admin), false);
-    }
-
-    #[test]
     fn record_fee_accrual_updates_state() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (admin, ds_id, _, _, fee_handler_id) = setup(&env);
-        let client = FeeHandlerClient::new(&env, &fee_handler_id);
-        
-        let ds = DataStoreClient::new(&env, &ds_id);
-        let token = Address::generate(&env);
-        let amount: i128 = 1000;
+        let w = setup();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        let market = Address::generate(&w.env);
+        let token = Address::generate(&w.env);
+        let key = claimable_fee_amount_key(&w.env, &market, &token);
+        assert_eq!(ds_c.get_u128(&key), 0);
 
-        // Ensure initially 0
-        let fee_tracker_key = keys::fee_tracker_key(&env, &token);
-        assert_eq!(ds.get_i128(&fee_tracker_key), 0);
-
-        client.record_fee_accrual(&token, &amount);
-
-        assert_eq!(ds.get_i128(&fee_tracker_key), 1000);
+        fh.record_fee_accrual(&w.admin, &market, &token, &1u32, &1000u128);
+        assert_eq!(ds_c.get_u128(&key), 1000);
+        assert_eq!(fh.claimable_fees(&market, &token), 1000);
     }
 
     #[test]
@@ -1346,13 +1322,13 @@ mod tests {
         let fh = FeeHandlerClient::new(&w.env, &w.handler);
         let market = Address::generate(&w.env);
 
-        assert_eq!(fh.is_auto_compound(&market), false);
+        assert!(!fh.is_auto_compound(&market));
 
         fh.set_auto_compound(&market, &true);
-        assert_eq!(fh.is_auto_compound(&market), true);
+        assert!(fh.is_auto_compound(&market));
 
         fh.set_auto_compound(&market, &false);
-        assert_eq!(fh.is_auto_compound(&market), false);
+        assert!(!fh.is_auto_compound(&market));
     }
 
     #[test]

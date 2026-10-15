@@ -976,6 +976,13 @@ mod tests {
         let collateral = ONE_TOKEN; // 1 token = $2000 at entry
         let size_usd = 20_000 * fp;
         open_long_position(&w, collateral, size_usd);
+        // The opening position fee is taken from the deposit, so the position
+        // holds slightly less than `collateral`; that stored amount is the cap.
+        let position_collateral = OHClient::new(&w.env, &w.ord_handler)
+            .get_position(&gmx_keys::position_key(&w.env, &w.user, &w.market_tk, &w.long_tk, true))
+            .expect("position must exist")
+            .collateral_amount;
+        assert!(position_collateral > 0 && position_collateral <= collateral);
 
         // Configure a fee far larger than the position's collateral could ever pay.
         let fee_amount = ONE_TOKEN * 1_000;
@@ -1003,7 +1010,7 @@ mod tests {
             soroban_sdk::token::Client::new(&w.env, &w.long_tk).balance(&w.liq_keeper);
         assert_eq!(
             keeper_balance_after - keeper_balance_before,
-            collateral,
+            position_collateral,
             "fee must be capped at the position's collateral, not the full configured fee"
         );
     }

@@ -8,6 +8,13 @@ on:
       - "docs/auth-audit.md"
       - "scripts/gen_auth_audit.py"
       - "scripts/test_gen_auth_audit.py"
+  push:
+    branches: [main]
+    paths:
+      - "contracts/**/src/lib.rs"
+      - "docs/auth-audit.md"
+      - "scripts/gen_auth_audit.py"
+      - "scripts/test_gen_auth_audit.py"
 
 permissions:
   contents: read

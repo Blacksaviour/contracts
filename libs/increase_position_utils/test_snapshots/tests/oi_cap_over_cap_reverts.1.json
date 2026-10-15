@@ -681,6 +681,9 @@
         }
       ]
     ],
+    [],
+    [],
+    [],
     []
   ],
   "ledger": {
@@ -3065,39 +3068,5 @@
       }
     ]
   },
-  "events": [
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        "type_": "contract",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "pos_inc"
-              }
-            ],
-            "data": {
-              "vec": [
-                {
-                  "bytes": "e3f2efe1064c1630a93e5b1a691290c23435298828f7d67c40a4158dd744bbee"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                },
-                {
-                  "i128": "2001000000000000000000000000000000"
-                },
-                {
-                  "i128": "2000000000000000000000000000000000"
-                }
-              ]
-            }
-          }
-        }
-      },
-      "failed_call": false
-    }
-  ]
+  "events": []
 }

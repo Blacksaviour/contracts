@@ -33,10 +33,8 @@ use soroban_sdk::{
 
 struct World {
     env: Env,
-    admin: Address,
     keeper: Address,
     user: Address,
-    ds: Address,
     oracle: Address,
     dep_vault: Address,
     ord_vault: Address,
@@ -110,10 +108,8 @@ fn setup() -> World {
 
     World {
         env,
-        admin,
         keeper,
         user,
-        ds,
         oracle: oracle_addr,
         dep_vault,
         ord_vault,

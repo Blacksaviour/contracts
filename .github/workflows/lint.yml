@@ -3,6 +3,10 @@ name: Lint
 on:
   pull_request:
     branches: [main]
+  # Also verify main after merges: two individually-green PRs can still
+  # combine into a broken branch.
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -20,6 +24,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          # tests/router_and_factory_coverage.rs embeds market_token.wasm.
+          targets: wasm32v1-none
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
@@ -35,5 +41,10 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+      # --all-targets: without it, #[cfg(test)] modules and tests/ are never
+      # compiled, and test code silently rots while lint stays green.
+      - name: Build WASM fixtures used by tests
+        run: cargo build -p market-token --target wasm32v1-none --release
+
       - name: cargo clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings

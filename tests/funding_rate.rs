@@ -110,6 +110,9 @@ fn setup() -> TestWorld {
     // Order handler
     let ord_handler = env.register(OrderHandler, ());
     OHClient::new(&env, &ord_handler).initialize(&admin, &rs, &ds, &oracle_addr, &ord_vault);
+    // Matches scripts/deploy.sh: order_handler writes to data_store and the
+    // order vault, both of which require CONTROLLER.
+    rs_c.grant_role(&admin, &ord_handler, &roles::controller(&env));
 
     // Reader
     let reader = env.register(Reader, ());
@@ -338,7 +341,7 @@ fn funding_rate_longs_pay_shorts_when_long_oi_exceeds_short() {
         size_delta_usd: 10_000 * ONE_USD,
         collateral_delta_amount: 1_000 * ONE_TOKEN,
         trigger_price: 0,
-        acceptable_price: 2_100 * ONE_USD,
+        acceptable_price: 1_900 * ONE_USD, // decrease: floor for longs, ceiling for shorts
         execution_fee: 0,
         min_output_amount: 0,
         order_type: OrderType::MarketDecrease,
@@ -440,7 +443,7 @@ fn funding_rate_shorts_pay_longs_when_short_oi_exceeds_long() {
         size_delta_usd: 10_000 * ONE_USD,
         collateral_delta_amount: 1_000 * ONE_TOKEN,
         trigger_price: 0,
-        acceptable_price: 1_900 * ONE_USD,
+        acceptable_price: 2_100 * ONE_USD, // decrease: floor for longs, ceiling for shorts
         execution_fee: 0,
         min_output_amount: 0,
         order_type: OrderType::MarketDecrease,
@@ -520,7 +523,7 @@ fn funding_rate_zero_when_oi_balanced() {
         size_delta_usd: 10_000 * ONE_USD,
         collateral_delta_amount: 1_000 * ONE_TOKEN,
         trigger_price: 0,
-        acceptable_price: 2_100 * ONE_USD,
+        acceptable_price: 1_900 * ONE_USD, // decrease: floor for longs, ceiling for shorts
         execution_fee: 0,
         min_output_amount: 0,
         order_type: OrderType::MarketDecrease,
@@ -595,7 +598,7 @@ fn funding_rate_zero_when_no_oi() {
         size_delta_usd: pos.size_in_usd,
         collateral_delta_amount: pos.collateral_amount,
         trigger_price: 0,
-        acceptable_price: 2_100 * ONE_USD,
+        acceptable_price: 1_900 * ONE_USD, // decrease: floor for longs, ceiling for shorts
         execution_fee: 0,
         min_output_amount: 0,
         order_type: OrderType::MarketDecrease,
@@ -670,7 +673,7 @@ fn funding_settlement_accumulates_claimable_amount() {
         size_delta_usd: 10_000 * ONE_USD,
         collateral_delta_amount: 1_000 * ONE_TOKEN,
         trigger_price: 0,
-        acceptable_price: 2_100 * ONE_USD,
+        acceptable_price: 1_900 * ONE_USD, // decrease: floor for longs, ceiling for shorts
         execution_fee: 0,
         min_output_amount: 0,
         order_type: OrderType::MarketDecrease,
@@ -742,7 +745,7 @@ fn funding_rate_ramps_proportionally_to_dt() {
         size_delta_usd: 10_000 * ONE_USD,
         collateral_delta_amount: 1_000 * ONE_TOKEN,
         trigger_price: 0,
-        acceptable_price: 2_100 * ONE_USD,
+        acceptable_price: 1_900 * ONE_USD, // decrease: floor for longs, ceiling for shorts
         execution_fee: 0,
         min_output_amount: 0,
         order_type: OrderType::MarketDecrease,
@@ -779,7 +782,7 @@ fn funding_rate_ramps_proportionally_to_dt() {
         size_delta_usd: 10_000 * ONE_USD,
         collateral_delta_amount: 1_000 * ONE_TOKEN,
         trigger_price: 0,
-        acceptable_price: 2_100 * ONE_USD,
+        acceptable_price: 1_900 * ONE_USD, // decrease: floor for longs, ceiling for shorts
         execution_fee: 0,
         min_output_amount: 0,
         order_type: OrderType::MarketDecrease,

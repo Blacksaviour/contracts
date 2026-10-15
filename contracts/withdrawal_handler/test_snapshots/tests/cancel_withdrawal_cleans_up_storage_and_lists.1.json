@@ -793,6 +793,30 @@
     [],
     [],
     [],
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2ZMN",
+              "function_name": "cancel_withdrawal",
+              "args": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
+                },
+                {
+                  "bytes": "da43abb95c59690d35d61c9af7e5f1502275c7e793fc40b583758759400df406"
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
+    ],
+    [],
+    [],
     []
   ],
   "ledger": {
@@ -1814,11 +1838,7 @@
               },
               "durability": "persistent",
               "val": {
-                "vec": [
-                  {
-                    "bytes": "da43abb95c59690d35d61c9af7e5f1502275c7e793fc40b583758759400df406"
-                  }
-                ]
+                "vec": []
               }
             }
           },
@@ -1845,11 +1865,7 @@
               },
               "durability": "persistent",
               "val": {
-                "vec": [
-                  {
-                    "bytes": "da43abb95c59690d35d61c9af7e5f1502275c7e793fc40b583758759400df406"
-                  }
-                ]
+                "vec": []
               }
             }
           },
@@ -2347,6 +2363,33 @@
             "contract_data": {
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "TokenBalance"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAXI7N"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "i128": "0"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
               "key": "ledger_key_contract_instance",
               "durability": "persistent",
               "val": {
@@ -2419,7 +2462,7 @@
               },
               "durability": "persistent",
               "val": {
-                "i128": "20000000000"
+                "i128": "0"
               }
             }
           },
@@ -2446,7 +2489,7 @@
               },
               "durability": "persistent",
               "val": {
-                "i128": "0"
+                "i128": "20000000000"
               }
             }
           },
@@ -2749,98 +2792,6 @@
             "contract_data": {
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2ZMN",
-              "key": {
-                "vec": [
-                  {
-                    "symbol": "Withdrawal"
-                  },
-                  {
-                    "bytes": "da43abb95c59690d35d61c9af7e5f1502275c7e793fc40b583758759400df406"
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
-                "map": [
-                  {
-                    "key": {
-                      "symbol": "account"
-                    },
-                    "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "execution_fee"
-                    },
-                    "val": {
-                      "i128": "0"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "market"
-                    },
-                    "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAXI7N"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "market_token_amount"
-                    },
-                    "val": {
-                      "i128": "20000000000"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "min_long_token_amount"
-                    },
-                    "val": {
-                      "i128": "0"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "min_short_token_amount"
-                    },
-                    "val": {
-                      "i128": "0"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "receiver"
-                    },
-                    "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "updated_at_time"
-                    },
-                    "val": {
-                      "u64": "0"
-                    }
-                  }
-                ]
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 4095
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2ZMN",
               "key": "ledger_key_contract_instance",
               "durability": "persistent",
               "val": {
@@ -2960,6 +2911,26 @@
               "key": {
                 "ledger_key_nonce": {
                   "nonce": "2578412842719982537"
+                }
+              },
+              "durability": "temporary",
+              "val": "void"
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5",
+              "key": {
+                "ledger_key_nonce": {
+                  "nonce": "5012940724606903311"
                 }
               },
               "durability": "temporary",

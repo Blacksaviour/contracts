@@ -120,6 +120,7 @@ trait IOracle {
 trait IWithdrawalVault {
     fn transfer_out(env: Env, caller: Address, token: Address, receiver: Address, amount: i128);
     fn get_recorded_balance(env: Env, token: Address) -> i128;
+    fn record_transfer_in(env: Env, caller: Address, token: Address) -> i128;
 }
 
 #[allow(dead_code)]
@@ -297,6 +298,13 @@ impl WithdrawalHandler {
                 &exec_fee,
             );
         }
+
+        // Snapshot the vault's balance so cancel_withdrawal's recorded-balance
+        // guard sees the LP tokens just received. Without this the recorded
+        // balance stays 0 and every cancellation reverts with
+        // InsufficientVaultBalance. Mirrors create_deposit.
+        WithdrawalVaultClient::new(&env, &withdrawal_vault)
+            .record_transfer_in(&handler, &params.market);
 
         // Allocate withdrawal key from nonce
         let nonce = ds.increment_nonce(&handler);
