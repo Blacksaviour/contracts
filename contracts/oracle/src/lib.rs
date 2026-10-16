@@ -426,15 +426,23 @@ impl Oracle {
         }
     }
 
-    /// Require that the stored price for `token` was signed for `expected_ledger_seq`.
-    /// Panics with `StalePrice` if the stored ledger sequence differs.
+    /// Require that the stored price for `token` is fresh relative to
+    /// `expected_ledger_seq` (callers pass the current ledger): it must have
+    /// been signed no later than that ledger and at most
+    /// `PRICE_FRESHNESS_WINDOW` ledgers before it.
+    ///
+    /// Exact equality (the previous rule) is unsatisfiable: the keeper signs at
+    /// the last closed ledger L, `set_prices` lands in L+1 or later, and
+    /// `execute_*` runs in a further transaction, so every deposit/withdrawal
+    /// reverted with `StalePrice` (SO4-Markets/so4-oracle#1205).
+    /// Panics with `StalePrice` otherwise.
     pub fn require_price_fresh(env: Env, token: Address, expected_ledger_seq: u32) -> PriceProps {
         let stored: StoredPrice = env
             .storage()
             .temporary()
             .get::<TempKey, StoredPrice>(&TempKey::Price(token))
             .unwrap_or_else(|| panic_with_error!(&env, Error::PriceNotFound));
-        if stored.ledger_seq != expected_ledger_seq {
+        if is_seq_stale(expected_ledger_seq, stored.ledger_seq, PRICE_FRESHNESS_WINDOW) {
             panic_with_error!(&env, Error::StalePrice);
         }
         PriceProps {
@@ -648,6 +656,13 @@ impl Oracle {
 /// Casts both values to u64 so the subtraction is always safe: when `submitted > current`
 /// (which happens after a u32 sequence wrap-around where a pre-wrap sequence numerically
 /// exceeds the post-wrap current) the first branch triggers and we treat it as stale.
+/// Max ledgers between the price's signing ledger and its use in
+/// `require_price_fresh` (~100s at 5s/ledger). Covers sign-at-L, `set_prices`
+/// confirmation, the keeper's post-confirmation delay and a cycle's sequential
+/// executions (50s cycle cap), while staying far tighter than the 60-ledger
+/// `set_prices` acceptance window (SO4-Markets/so4-oracle#1205).
+pub const PRICE_FRESHNESS_WINDOW: u32 = 20;
+
 fn is_seq_stale(current: u32, submitted: u32, window: u32) -> bool {
     let c = current as u64;
     let s = submitted as u64;
@@ -1076,6 +1091,35 @@ mod tests {
         }
 
         client.clear_prices(&admin, &tokens);
+    }
+
+    // ── so4-oracle#1205: require_price_fresh uses a window, not equality ─────
+
+    /// The keeper signs at closed ledger L; executions land a few ledgers later.
+    #[test]
+    fn price_freshness_window_accepts_keeper_flow_and_rejects_old_or_future() {
+        let signed_at = 1_000;
+        // set_prices lands in L+1, executions follow within the window.
+        for current in [
+            signed_at,
+            signed_at + 1,
+            signed_at + 5,
+            signed_at + PRICE_FRESHNESS_WINDOW,
+        ] {
+            assert!(
+                !is_seq_stale(current, signed_at, PRICE_FRESHNESS_WINDOW),
+                "price signed at {signed_at} must be fresh at {current}"
+            );
+        }
+        assert!(is_seq_stale(
+            signed_at + PRICE_FRESHNESS_WINDOW + 1,
+            signed_at,
+            PRICE_FRESHNESS_WINDOW
+        ));
+        // A price signed for a future ledger is never fresh.
+        assert!(is_seq_stale(signed_at, signed_at + 1, PRICE_FRESHNESS_WINDOW));
+        // Stays tighter than the set_prices acceptance window.
+        assert!(PRICE_FRESHNESS_WINDOW < 60);
     }
 
     // ── Issue #172: ledger sequence wrap-around staleness ─────────────────────
