@@ -104,6 +104,7 @@ Do not treat a green CI run as evidence your change is sound. As currently confi
 | `test.yml` | `cargo build --target wasm32v1-none --release`, `cargo test --workspace` | WASM build + all tests |
 | `wasm-size.yml` | `cargo build --target ... --release` | Build + size budget (PR only — compares against base) |
 | `auth-audit.yml` | `docs/auth-audit.md` sync check | Docs only |
+| `resource-bench.yml` | `tests/resource_bench.rs` + `scripts/bench_compare.py` | Soroban resource regressions vs `docs/benchmarks/resource-baseline.json`, bounded-constant guard |
 
 `lint.yml`, `test.yml` and `auth-audit.yml` run on both `pull_request` and `push` to `main`.
 CI still does not run `stellar contract build`, deploy, or `make testnet-smoke` — verify deploy-path

@@ -108,3 +108,7 @@ path = "order_cleanup.rs"
 [[test]]
 name = "router_and_factory_coverage"
 path = "router_and_factory_coverage.rs"
+
+[[test]]
+name = "resource_bench"
+path = "resource_bench.rs"
