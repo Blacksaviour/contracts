@@ -309,8 +309,7 @@ impl FeeHandler {
             .instance()
             .get(&InstanceKey::DataStore)
             .unwrap();
-        DataStoreClient::new(&env, &data_store)
-            .get_bool(&auto_compound_fees_key(&env, &market))
+        DataStoreClient::new(&env, &data_store).get_bool(&auto_compound_fees_key(&env, &market))
     }
 
     /// Record fee accrual and emit FeeAccrued event with fee_type breakdown (Issue #515).
@@ -330,7 +329,11 @@ impl FeeHandler {
             .get(&InstanceKey::DataStore)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let key = claimable_fee_amount_key(&env, &market, &token);
-        DataStoreClient::new(&env, &data_store).apply_delta_to_u128(&caller, &key, &(amount as i128));
+        DataStoreClient::new(&env, &data_store).apply_delta_to_u128(
+            &caller,
+            &key,
+            &(amount as i128),
+        );
 
         env.events().publish_event(&FeeAccrued {
             market,
@@ -746,8 +749,7 @@ mod tests {
 
         // Only pool_held was transferred — pool cannot be over-drained
         assert_eq!(
-            transferred,
-            pool_held as u128,
+            transferred, pool_held as u128,
             "transfer must be capped at actual pool balance"
         );
 
@@ -768,7 +770,10 @@ mod tests {
 
         // Receiver's token balance reflects only what was actually transferred
         let recv_bal = soroban_sdk::token::Client::new(&w.env, &w.long_tk).balance(&receiver);
-        assert_eq!(recv_bal, pool_held, "receiver gets only the pool-backed amount");
+        assert_eq!(
+            recv_bal, pool_held,
+            "receiver gets only the pool-backed amount"
+        );
     }
 
     /// claim_fees must revert with InsufficientPoolBalance when the stored
@@ -815,8 +820,7 @@ mod tests {
         // Mint a large fixed real balance once so only the pool_amount guard (not
         // the real-balance cap) is ever the limiting factor across all iterations.
         let max_per_iter = ONE_TOKEN * 10;
-        StellarAssetClient::new(&w.env, &w.long_tk)
-            .mint(&w.market_tk, &(max_per_iter * 2_000));
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &(max_per_iter * 2_000));
 
         // Linear-congruential generator — deterministic, good period, no std needed.
         let mut state: u64 = 0x1234_5678_9abc_def0_u64;
@@ -837,14 +841,22 @@ mod tests {
 
             let receiver = Address::generate(&w.env);
             if claimable > pool_amount {
-                let result = FeeHandlerClient::new(&w.env, &w.handler)
-                    .try_claim_fees(&w.keeper, &w.market_tk, &w.long_tk, &receiver);
+                let result = FeeHandlerClient::new(&w.env, &w.handler).try_claim_fees(
+                    &w.keeper,
+                    &w.market_tk,
+                    &w.long_tk,
+                    &receiver,
+                );
                 assert!(result.is_err(), "must revert when claimable > pool_amount");
                 // A reverted call must leave pool_amount unchanged, never underflowed.
                 assert_eq!(ds_c.get_u128(&pool_key), pool_amount);
             } else {
-                FeeHandlerClient::new(&w.env, &w.handler)
-                    .claim_fees(&w.keeper, &w.market_tk, &w.long_tk, &receiver);
+                FeeHandlerClient::new(&w.env, &w.handler).claim_fees(
+                    &w.keeper,
+                    &w.market_tk,
+                    &w.long_tk,
+                    &receiver,
+                );
                 assert!(
                     ds_c.get_u128(&pool_key) <= pool_amount,
                     "pool_amount must never increase or underflow past its prior value"
@@ -1254,8 +1266,7 @@ mod tests {
             let collateral_price = ((r3.abs() % (100_000 * fp / fp)).max(1)) * fp;
 
             // Fee in USD — ceiling so pool never under-collects (matches production)
-            let fee_usd_ceil =
-                gmx_math::mul_div_wide_up(&env, size_delta_usd, fee_factor, fp);
+            let fee_usd_ceil = gmx_math::mul_div_wide_up(&env, size_delta_usd, fee_factor, fp);
             let fee_usd_floor = gmx_math::mul_div_wide(&env, size_delta_usd, fee_factor, fp);
 
             // Property 1: ceiling >= floor
@@ -1273,10 +1284,8 @@ mod tests {
             );
 
             // Fee in collateral tokens — ceiling again
-            let fee_tok_ceil =
-                gmx_math::mul_div_wide_up(&env, fee_usd_ceil, tp, collateral_price);
-            let fee_tok_floor =
-                gmx_math::mul_div_wide(&env, fee_usd_ceil, tp, collateral_price);
+            let fee_tok_ceil = gmx_math::mul_div_wide_up(&env, fee_usd_ceil, tp, collateral_price);
+            let fee_tok_floor = gmx_math::mul_div_wide(&env, fee_usd_ceil, tp, collateral_price);
 
             assert!(
                 fee_tok_ceil >= fee_tok_floor,

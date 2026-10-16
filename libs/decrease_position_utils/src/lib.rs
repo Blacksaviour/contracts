@@ -132,13 +132,7 @@ pub fn decrease_position(env: &Env, p: &DecreasePositionParams) -> DecreasePosit
 
     // 2. Update market funding + borrowing state
     let index_price_mid = p.index_token_price.mid_price();
-    update_funding_state(
-        env,
-        p.data_store,
-        p.caller,
-        p.market,
-        p.current_time,
-    );
+    update_funding_state(env, p.data_store, p.caller, p.market, p.current_time);
     update_cumulative_borrowing_factor(
         env,
         p.data_store,
@@ -369,9 +363,11 @@ pub fn decrease_position(env: &Env, p: &DecreasePositionParams) -> DecreasePosit
         // the account/global position-list indexes that already do so via
         // remove_bytes32_from_set, so the index can't outlive the entry it
         // points to.
-        env.storage()
-            .persistent()
-            .extend_ttl(&storage_key, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+        env.storage().persistent().extend_ttl(
+            &storage_key,
+            MIN_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_TARGET,
+        );
     }
 
     // 14. Transfer output to receiver, optionally swapping to requested token
@@ -919,7 +915,10 @@ mod tests {
         let collateral = ONE_TOKEN * 10;
         plant_position(&w, size_usd, collateral, index_price);
         let market = make_market(&w);
-        let price = PriceProps { min: index_price, max: index_price };
+        let price = PriceProps {
+            min: index_price,
+            max: index_price,
+        };
         // For a long close (is_long=true, is_increase=false) with zero price impact,
         // execution_price == index_price. Setting acceptable_price just below means
         // the gate (execution_price >= acceptable_price) passes.
@@ -934,7 +933,7 @@ mod tests {
                     market: &market,
                     collateral_token: &w.long_tk,
                     size_delta_usd: size_usd,
-                    acceptable_price: index_price - 1,  // just below execution_price
+                    acceptable_price: index_price - 1, // just below execution_price
                     is_long: true,
                     index_token_price: &price,
                     collateral_price: index_price,
@@ -945,7 +944,10 @@ mod tests {
                 },
             )
         });
-        assert!(result.output_amount >= 0, "should succeed with acceptable_price below exec");
+        assert!(
+            result.output_amount >= 0,
+            "should succeed with acceptable_price below exec"
+        );
     }
 
     /// Long close: acceptable_price above execution_price — slippage gate rejects (#382).
@@ -959,7 +961,10 @@ mod tests {
         let collateral = ONE_TOKEN * 10;
         plant_position(&w, size_usd, collateral, index_price);
         let market = make_market(&w);
-        let price = PriceProps { min: index_price, max: index_price };
+        let price = PriceProps {
+            min: index_price,
+            max: index_price,
+        };
         // execution_price == index_price; setting acceptable_price above it must panic.
         w.env.as_contract(&w.caller, || {
             decrease_position(
@@ -972,7 +977,7 @@ mod tests {
                     market: &market,
                     collateral_token: &w.long_tk,
                     size_delta_usd: size_usd,
-                    acceptable_price: index_price + 1,  // above execution_price → reject
+                    acceptable_price: index_price + 1, // above execution_price → reject
                     is_long: true,
                     index_token_price: &price,
                     collateral_price: index_price,
@@ -995,7 +1000,10 @@ mod tests {
         let collateral = ONE_TOKEN * 10;
         plant_short_position(&w, size_usd, collateral, index_price);
         let market = make_market(&w);
-        let price = PriceProps { min: index_price, max: index_price };
+        let price = PriceProps {
+            min: index_price,
+            max: index_price,
+        };
         // For a short close (is_long=false), the gate checks execution_price <= acceptable_price.
         // Setting acceptable_price above execution_price should pass.
         let result = w.env.as_contract(&w.caller, || {
@@ -1009,7 +1017,7 @@ mod tests {
                     market: &market,
                     collateral_token: &w.short_tk,
                     size_delta_usd: size_usd,
-                    acceptable_price: index_price + 1,  // above execution_price → accept
+                    acceptable_price: index_price + 1, // above execution_price → accept
                     is_long: false,
                     index_token_price: &price,
                     collateral_price: index_price,
@@ -1034,7 +1042,10 @@ mod tests {
         let collateral = ONE_TOKEN * 10;
         plant_short_position(&w, size_usd, collateral, index_price);
         let market = make_market(&w);
-        let price = PriceProps { min: index_price, max: index_price };
+        let price = PriceProps {
+            min: index_price,
+            max: index_price,
+        };
         // execution_price == index_price; acceptable_price below it must panic for shorts.
         w.env.as_contract(&w.caller, || {
             decrease_position(
@@ -1047,7 +1058,7 @@ mod tests {
                     market: &market,
                     collateral_token: &w.short_tk,
                     size_delta_usd: size_usd,
-                    acceptable_price: index_price - 1,  // below execution_price → reject
+                    acceptable_price: index_price - 1, // below execution_price → reject
                     is_long: false,
                     index_token_price: &price,
                     collateral_price: index_price,

@@ -178,7 +178,10 @@ impl OrderCleanup {
         let order = OrderHandlerClient::new(&env, &order_handler).get_order(&key);
         if let Some(order) = order {
             let expiry = expiry_for_order(&env, &data_store, &order.order_type);
-            let age = env.ledger().timestamp().saturating_sub(order.updated_at_time);
+            let age = env
+                .ledger()
+                .timestamp()
+                .saturating_sub(order.updated_at_time);
             ExpiredOrderPreview {
                 exists: true,
                 is_expired: age >= expiry,
@@ -261,7 +264,8 @@ mod tests {
         assert_eq!(res.unwrap_err().unwrap(), Error::NotYetExpired.into());
 
         env.ledger().set_timestamp(114_400); // 14,400 seconds later
-        let res2 = client.try_cancel_expired_order(&data_store_id, &order_handler_id, &caller, &key);
+        let res2 =
+            client.try_cancel_expired_order(&data_store_id, &order_handler_id, &caller, &key);
         assert!(res2.is_ok());
     }
 
@@ -269,7 +273,9 @@ mod tests {
     struct MockDataStore;
     #[contractimpl]
     impl MockDataStore {
-        pub fn get_u128(_env: Env, _key: BytesN<32>) -> u128 { 0 }
+        pub fn get_u128(_env: Env, _key: BytesN<32>) -> u128 {
+            0
+        }
     }
 
     #[contract]
