@@ -829,7 +829,6 @@ pub fn keeper_slash_threshold_key(env: &Env) -> BytesN<32> {
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

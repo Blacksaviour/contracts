@@ -197,7 +197,11 @@ pub fn swap_with_path(
     let max_len = {
         let raw =
             DataStoreClient::new(env, data_store).get_u128(&max_swap_path_length_key(env)) as usize;
-        if raw == 0 { MAX_SWAP_PATH_LENGTH } else { raw }
+        if raw == 0 {
+            MAX_SWAP_PATH_LENGTH
+        } else {
+            raw
+        }
     };
     if path_len as usize > max_len {
         soroban_sdk::panic_with_error!(env, soroban_sdk::Error::from_contract_error(2u32));
