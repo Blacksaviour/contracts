@@ -116,3 +116,5 @@ path = "resource_bench.rs"
 [[test]]
 name = "clob_properties"
 path = "clob_properties.rs"
+name = "privileged_auth_matrix"
+path = "privileged_auth_matrix.rs"
