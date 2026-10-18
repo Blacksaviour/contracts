@@ -112,3 +112,7 @@ path = "router_and_factory_coverage.rs"
 [[test]]
 name = "resource_bench"
 path = "resource_bench.rs"
+
+[[test]]
+name = "clob_properties"
+path = "clob_properties.rs"
