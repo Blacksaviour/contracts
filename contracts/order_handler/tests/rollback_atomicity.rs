@@ -6,14 +6,13 @@ use data_store::{DataStore, DataStoreClient as DsClient};
 use deposit_handler::{DepositHandler, DepositHandlerClient};
 use deposit_vault::{DepositVault, DepositVaultClient as DVClient};
 use gmx_keys::roles;
-use gmx_types::{CreateDepositParams, OrderType};
 use market_token::{MarketToken, MarketTokenClient as MtClient};
 use oracle::{Oracle, OracleClient as OClient};
-use order_handler::{CreateOrderParams, OrderHandler, OrderHandlerClient};
+use order_handler::{OrderHandler, OrderHandlerClient};
 use order_vault::{OrderVault, OrderVaultClient as OVClient};
 use role_store::{RoleStore, RoleStoreClient as RsClient};
-use rollback_harness::{RollbackHarness, StateSnapshot};
-use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Address, Env, Map, Vec};
+use rollback_harness::RollbackHarness;
+use soroban_sdk::{testutils::Address as _, Address, Env, Map, Vec};
 
 #[allow(dead_code)]
 struct World {
@@ -95,7 +94,6 @@ fn setup() -> World {
         &ds,
         &oracle_addr,
         &ord_vault,
-        &market_tk,
     );
     rs_c.grant_role(&admin, &ord_handler, &roles::controller(&env));
 
@@ -123,15 +121,10 @@ fn snapshot_captures_protocol_state() {
     let liabilities: Map<Address, i128> = Map::new(&world.env);
     let orders: Vec<gmx_types::OrderProps> = Vec::new(&world.env);
 
-    let snapshot = RollbackHarness::snapshot_protocol_state(
-        &world.env,
-        balances,
-        fees,
-        liabilities,
-        orders,
-    );
+    let snapshot =
+        RollbackHarness::snapshot_protocol_state(&world.env, balances, fees, liabilities, orders);
 
-    assert_eq!(world.env.ledger().sequence(), snapshot.block_height);
+    assert_eq!(world.env.ledger().sequence() as u64, snapshot.block_height);
 }
 
 #[test]
@@ -145,13 +138,8 @@ fn rollback_detects_state_changes() {
     let liabilities: Map<Address, i128> = Map::new(&world.env);
     let orders: Vec<gmx_types::OrderProps> = Vec::new(&world.env);
 
-    let snapshot = RollbackHarness::snapshot_protocol_state(
-        &world.env,
-        balances,
-        fees,
-        liabilities,
-        orders,
-    );
+    let snapshot =
+        RollbackHarness::snapshot_protocol_state(&world.env, balances, fees, liabilities, orders);
 
     // Mutate balances after snapshot
     let mut new_balances: Map<Address, i128> = Map::new(&world.env);
@@ -169,7 +157,10 @@ fn rollback_detects_state_changes() {
     );
 
     assert!(!validation.is_valid(), "should detect balance change");
-    assert!(!validation.balances_match, "balance_mismatch should be detected");
+    assert!(
+        !validation.balances_match,
+        "balance_mismatch should be detected"
+    );
 }
 
 #[test]
@@ -201,7 +192,10 @@ fn rollback_validates_full_revert() {
     );
 
     assert!(validation.is_valid(), "should validate full revert");
-    assert!(validation.state_fully_reverted, "state_fully_reverted should be true");
+    assert!(
+        validation.state_fully_reverted,
+        "state_fully_reverted should be true"
+    );
 }
 
 #[test]
