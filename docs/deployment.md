@@ -31,6 +31,8 @@ stellar keys generate --global "$SOURCE" --network "$NETWORK" --fund
 # stellar keys fund "$SOURCE" --network "$NETWORK"
 
 export ADMIN=$(stellar keys address "$SOURCE")
+# Destination for claimed protocol fees (fee_handler::set_fee_receiver).
+export TREASURY="$ADMIN"
 curl "https://friendbot.stellar.org/?addr=$ADMIN" # alternative Friendbot call
 ```
 
@@ -170,6 +172,10 @@ invoke "$ADL_HANDLER" initialize \
 FEE_HANDLER=$(deploy fee_handler)
 invoke "$FEE_HANDLER" initialize \
   --admin "$ADMIN" --role_store "$ROLE_STORE" --data_store "$DATA_STORE"
+# Protocol fees are only paid to configured recipients; claim_fees reverts with
+# FeeReceiverNotSet until this is set. Optional per-market overrides:
+#   invoke "$FEE_HANDLER" set_market_fee_receiver --market <C...> --receiver <G.../C...>
+invoke "$FEE_HANDLER" set_fee_receiver --receiver "$TREASURY"
 
 REFERRAL_STORAGE=$(deploy referral_storage)
 invoke "$REFERRAL_STORAGE" initialize --admin "$ADMIN"

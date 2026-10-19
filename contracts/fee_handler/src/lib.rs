@@ -5,7 +5,8 @@
 
 use gmx_keys::{
     auto_compound_fees_key, claimable_fee_amount_key, claimable_funding_amount_key,
-    claimable_ui_fee_amount_key, pool_amount_key, roles, ui_fee_factor_key,
+    claimable_ui_fee_amount_key, pool_amount_key, roles, ui_fee_factor_key, MIN_BUMP_THRESHOLD,
+    PERSISTENT_BUMP_TARGET,
 };
 use gmx_math::FLOAT_PRECISION;
 use soroban_sdk::{
@@ -21,6 +22,16 @@ enum InstanceKey {
     Admin,
     RoleStore,
     DataStore,
+    /// Protocol-wide destination for claimed protocol fees. Written only by
+    /// `set_fee_receiver`.
+    ProtocolFeeReceiver,
+}
+
+/// Per-market fee-recipient overrides (issuer / partner destinations). Kept in
+/// persistent storage so the number of markets does not grow instance storage.
+#[contracttype]
+enum PersistentKey {
+    MarketFeeReceiver(Address),
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -38,6 +49,12 @@ pub enum Error {
     /// claimable amount — a rounding-accumulation discrepancy — so the claim
     /// is rejected rather than allowed to overdraft the pool's accounting.
     InsufficientPoolBalance = 6,
+    /// No protocol or market fee recipient is configured, so protocol fees have
+    /// no trusted destination and stay claimable.
+    FeeReceiverNotSet = 7,
+    /// The recipient would be the market pool itself or this handler — paying
+    /// fees there would decrement `pool_amount` without tokens leaving the pool.
+    InvalidFeeReceiver = 8,
 }
 
 // ─── External clients ─────────────────────────────────────────────────────────
@@ -121,6 +138,18 @@ pub struct UiFeeFactorSet {
     pub factor: u128,
 }
 
+/// Emitted on every change to a fee recipient. `market` is `None` for the
+/// protocol-wide recipient and `Some` for a per-market override; `receiver` is
+/// `None` when a market override is cleared (the market falls back to the
+/// protocol recipient).
+#[contractevent(topics = ["fee_rcv"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeReceiverSet {
+    pub market: Option<Address>,
+    pub previous: Option<Address>,
+    pub receiver: Option<Address>,
+}
+
 #[contractevent(topics = ["fee_acc"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeAccrued {
@@ -147,6 +176,38 @@ fn safe_transfer_amount(env: &Env, token: &Address, pool: &Address, requested: u
         return 0;
     }
     requested.min(pool_balance as u128)
+}
+
+fn require_admin(env: &Env) {
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&InstanceKey::Admin)
+        .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+    admin.require_auth();
+}
+
+fn market_fee_receiver(env: &Env, market: &Address) -> Option<Address> {
+    let key = PersistentKey::MarketFeeReceiver(market.clone());
+    let receiver: Option<Address> = env.storage().persistent().get(&key);
+    if receiver.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, MIN_BUMP_THRESHOLD, PERSISTENT_BUMP_TARGET);
+    }
+    receiver
+}
+
+fn protocol_fee_receiver(env: &Env) -> Option<Address> {
+    env.storage()
+        .instance()
+        .get(&InstanceKey::ProtocolFeeReceiver)
+}
+
+/// The single trusted destination for `market`'s protocol fees: the market
+/// override if one is set, otherwise the protocol-wide recipient.
+fn resolve_fee_receiver(env: &Env, market: &Address) -> Option<Address> {
+    market_fee_receiver(env, market).or_else(|| protocol_fee_receiver(env))
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -184,7 +245,13 @@ impl FeeHandler {
         DataStoreClient::new(&env, &data_store).get_u128(&key)
     }
 
-    /// Sweep accumulated protocol fees for a market/token to `receiver`. FEE_KEEPER only.
+    /// Sweep accumulated protocol fees for a market/token to the market's
+    /// configured fee recipient. FEE_KEEPER only.
+    ///
+    /// The destination is never caller-supplied: it is the per-market override
+    /// set by `set_market_fee_receiver`, or else the protocol recipient set by
+    /// `set_fee_receiver`. With neither configured the call reverts with
+    /// `FeeReceiverNotSet` and the fees stay claimable.
     ///
     /// Before withdrawing, the claimable amount is validated against the pool's
     /// tracked `pool_amount` and rejected with `InsufficientPoolBalance` if it
@@ -193,13 +260,7 @@ impl FeeHandler {
     /// In practice all three values agree because fees are accrued with ceiling
     /// rounding, so the pool always holds at least as many tokens as are recorded
     /// as claimable. `pool_amount` is decremented by exactly what is transferred.
-    pub fn claim_fees(
-        env: Env,
-        keeper: Address,
-        market: Address,
-        token: Address,
-        receiver: Address,
-    ) -> u128 {
+    pub fn claim_fees(env: Env, keeper: Address, market: Address, token: Address) -> u128 {
         keeper.require_auth();
 
         let role_store: Address = env
@@ -209,6 +270,14 @@ impl FeeHandler {
             .unwrap();
         if !RoleStoreClient::new(&env, &role_store).has_role(&keeper, &roles::fee_keeper(&env)) {
             panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let receiver = resolve_fee_receiver(&env, &market)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::FeeReceiverNotSet));
+        // The protocol recipient is validated against this handler when set, but
+        // it cannot be checked against every market up front.
+        if receiver == market {
+            panic_with_error!(&env, Error::InvalidFeeReceiver);
         }
 
         let data_store: Address = env
@@ -274,6 +343,72 @@ impl FeeHandler {
             receiver,
         });
         transfer_amount
+    }
+
+    // ── Constrained fee recipients ───────────────────────────────────────────
+
+    /// Return the recipient `claim_fees` will pay for `market`: its override if
+    /// set, else the protocol recipient, else `None`.
+    pub fn get_fee_receiver(env: Env, market: Address) -> Option<Address> {
+        resolve_fee_receiver(&env, &market)
+    }
+
+    /// Return the protocol-wide fee recipient, if configured.
+    pub fn get_protocol_fee_receiver(env: Env) -> Option<Address> {
+        protocol_fee_receiver(&env)
+    }
+
+    /// Return `market`'s fee-recipient override, if configured.
+    pub fn get_market_fee_receiver(env: Env, market: Address) -> Option<Address> {
+        market_fee_receiver(&env, &market)
+    }
+
+    /// Set the protocol-wide fee recipient (treasury). Admin only; emits
+    /// `FeeReceiverSet` with `market: None`. The recipient cannot be cleared,
+    /// only replaced, so a configured protocol never loses its fee destination.
+    pub fn set_fee_receiver(env: Env, receiver: Address) {
+        require_admin(&env);
+        if receiver == env.current_contract_address() {
+            panic_with_error!(&env, Error::InvalidFeeReceiver);
+        }
+        let previous = protocol_fee_receiver(&env);
+        env.storage()
+            .instance()
+            .set(&InstanceKey::ProtocolFeeReceiver, &receiver);
+        env.events().publish_event(&FeeReceiverSet {
+            market: None,
+            previous,
+            receiver: Some(receiver),
+        });
+    }
+
+    /// Set (`Some`) or clear (`None`) `market`'s fee-recipient override for
+    /// issuer- or partner-specific destinations. Admin only; emits
+    /// `FeeReceiverSet` with `market: Some(market)`. The override may not be the
+    /// market pool itself or this handler.
+    pub fn set_market_fee_receiver(env: Env, market: Address, receiver: Option<Address>) {
+        require_admin(&env);
+        let key = PersistentKey::MarketFeeReceiver(market.clone());
+        let previous = market_fee_receiver(&env, &market);
+        match &receiver {
+            Some(r) => {
+                if *r == market || *r == env.current_contract_address() {
+                    panic_with_error!(&env, Error::InvalidFeeReceiver);
+                }
+                env.storage().persistent().set(&key, r);
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    MIN_BUMP_THRESHOLD,
+                    PERSISTENT_BUMP_TARGET,
+                );
+            }
+            None => env.storage().persistent().remove(&key),
+        }
+        env.events().publish_event(&FeeReceiverSet {
+            market: Some(market),
+            previous,
+            receiver,
+        });
     }
 
     // ── Issue #285: auto-compound LP fees ────────────────────────────────────
@@ -568,6 +703,7 @@ mod tests {
         env: Env,
         admin: Address,
         keeper: Address,
+        treasury: Address,
         rs: Address,
         ds: Address,
         market_tk: Address,
@@ -575,7 +711,16 @@ mod tests {
         handler: Address,
     }
 
+    /// A fresh world with the protocol treasury configured as the fee recipient.
     fn setup() -> World {
+        let w = setup_without_fee_receiver();
+        FeeHandlerClient::new(&w.env, &w.handler).set_fee_receiver(&w.treasury);
+        w
+    }
+
+    /// A fresh world in which no fee recipient has been configured yet (the
+    /// state of a freshly deployed or freshly upgraded handler).
+    fn setup_without_fee_receiver() -> World {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -611,10 +756,13 @@ mod tests {
         FeeHandlerClient::new(&env, &handler).initialize(&admin, &rs, &ds);
         rs_c.grant_role(&admin, &handler, &roles::controller(&env));
 
+        let treasury = Address::generate(&env);
+
         World {
             env,
             admin,
             keeper,
+            treasury,
             rs,
             ds,
             market_tk,
@@ -654,15 +802,10 @@ mod tests {
         // Mint tokens into the market pool so withdraw_from_pool can transfer
         StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &(fee_amount as i128));
 
-        let receiver = Address::generate(&w.env);
+        let receiver = w.treasury.clone();
         let bal_before = soroban_sdk::token::Client::new(&w.env, &w.long_tk).balance(&receiver);
 
-        FeeHandlerClient::new(&w.env, &w.handler).claim_fees(
-            &w.keeper,
-            &w.market_tk,
-            &w.long_tk,
-            &receiver,
-        );
+        FeeHandlerClient::new(&w.env, &w.handler).claim_fees(&w.keeper, &w.market_tk, &w.long_tk);
 
         let bal_after = soroban_sdk::token::Client::new(&w.env, &w.long_tk).balance(&receiver);
         assert_eq!(
@@ -689,12 +832,10 @@ mod tests {
     #[test]
     fn claim_fees_returns_zero_when_nothing_to_claim() {
         let w = setup();
-        let receiver = Address::generate(&w.env);
         let claimed = FeeHandlerClient::new(&w.env, &w.handler).claim_fees(
             &w.keeper,
             &w.market_tk,
             &w.long_tk,
-            &receiver,
         );
         assert_eq!(
             claimed, 0,
@@ -713,13 +854,7 @@ mod tests {
         StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &ONE_TOKEN);
 
         let intruder = Address::generate(&w.env);
-        let receiver = Address::generate(&w.env);
-        FeeHandlerClient::new(&w.env, &w.handler).claim_fees(
-            &intruder,
-            &w.market_tk,
-            &w.long_tk,
-            &receiver,
-        );
+        FeeHandlerClient::new(&w.env, &w.handler).claim_fees(&intruder, &w.market_tk, &w.long_tk);
     }
 
     /// claim_fees real-balance guard: pool_amount accounting backs the full
@@ -739,12 +874,11 @@ mod tests {
         ds_c.set_u128(&w.admin, &pool_key, &claimable);
         StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &pool_held);
 
-        let receiver = Address::generate(&w.env);
+        let receiver = w.treasury.clone();
         let transferred = FeeHandlerClient::new(&w.env, &w.handler).claim_fees(
             &w.keeper,
             &w.market_tk,
             &w.long_tk,
-            &receiver,
         );
 
         // Only pool_held was transferred — pool cannot be over-drained
@@ -795,13 +929,7 @@ mod tests {
         // reject the claim before any transfer is attempted.
         StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &(claimable as i128));
 
-        let receiver = Address::generate(&w.env);
-        FeeHandlerClient::new(&w.env, &w.handler).claim_fees(
-            &w.keeper,
-            &w.market_tk,
-            &w.long_tk,
-            &receiver,
-        );
+        FeeHandlerClient::new(&w.env, &w.handler).claim_fees(&w.keeper, &w.market_tk, &w.long_tk);
     }
 
     /// Fuzz test (issue #254 AC): claim across many random (claimable, pool_amount)
@@ -839,13 +967,11 @@ mod tests {
             ds_c.set_u128(&w.admin, &fee_key, &claimable);
             ds_c.set_u128(&w.admin, &pool_key, &pool_amount);
 
-            let receiver = Address::generate(&w.env);
             if claimable > pool_amount {
                 let result = FeeHandlerClient::new(&w.env, &w.handler).try_claim_fees(
                     &w.keeper,
                     &w.market_tk,
                     &w.long_tk,
-                    &receiver,
                 );
                 assert!(result.is_err(), "must revert when claimable > pool_amount");
                 // A reverted call must leave pool_amount unchanged, never underflowed.
@@ -855,7 +981,6 @@ mod tests {
                     &w.keeper,
                     &w.market_tk,
                     &w.long_tk,
-                    &receiver,
                 );
                 assert!(
                     ds_c.get_u128(&pool_key) <= pool_amount,
@@ -920,12 +1045,244 @@ mod tests {
         let w = setup();
         let impostor = Address::generate(&w.env);
         // impostor has no FEE_KEEPER role — must panic with Unauthorized.
-        FeeHandlerClient::new(&w.env, &w.handler).claim_fees(
-            &impostor,
+        FeeHandlerClient::new(&w.env, &w.handler).claim_fees(&impostor, &w.market_tk, &w.long_tk);
+    }
+
+    // ── Constrained fee recipients ────────────────────────────────────────────
+
+    /// Seed `amount` of claimable protocol fees for `market`, backed by matching
+    /// `pool_amount` accounting and real pool tokens.
+    fn seed_fees(w: &World, market: &Address, amount: u128) {
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        ds_c.set_u128(
+            &w.admin,
+            &gmx_keys::claimable_fee_amount_key(&w.env, market, &w.long_tk),
+            &amount,
+        );
+        ds_c.set_u128(
+            &w.admin,
+            &gmx_keys::pool_amount_key(&w.env, market, &w.long_tk),
+            &amount,
+        );
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(market, &(amount as i128));
+    }
+
+    fn balance(w: &World, who: &Address) -> i128 {
+        soroban_sdk::token::Client::new(&w.env, &w.long_tk).balance(who)
+    }
+
+    fn assert_err(result_err: soroban_sdk::Error, expected: Error) {
+        assert_eq!(result_err, soroban_sdk::Error::from(expected));
+    }
+
+    /// Fees go to the configured treasury; the keeper who triggers the sweep
+    /// gains nothing and has no argument with which to name a destination.
+    #[test]
+    fn claim_fees_pays_configured_protocol_receiver_only() {
+        let w = setup();
+        seed_fees(&w, &w.market_tk, 1_000);
+
+        let claimed = FeeHandlerClient::new(&w.env, &w.handler).claim_fees(
+            &w.keeper,
             &w.market_tk,
             &w.long_tk,
-            &w.admin,
         );
+
+        assert_eq!(claimed, 1_000);
+        assert_eq!(balance(&w, &w.treasury), 1_000);
+        assert_eq!(balance(&w, &w.keeper), 0);
+        assert_eq!(balance(&w, &w.market_tk), 0);
+    }
+
+    /// Without a configured recipient the claim reverts and leaves the
+    /// claimable balance, pool accounting and pool tokens untouched.
+    #[test]
+    fn claim_fees_without_configured_receiver_reverts_and_keeps_fees() {
+        let w = setup_without_fee_receiver();
+        seed_fees(&w, &w.market_tk, 1_000);
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        assert_eq!(fh.get_fee_receiver(&w.market_tk), None);
+
+        let err = fh
+            .try_claim_fees(&w.keeper, &w.market_tk, &w.long_tk)
+            .unwrap_err()
+            .unwrap();
+        assert_err(err, Error::FeeReceiverNotSet);
+
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        assert_eq!(fh.claimable_fees(&w.market_tk, &w.long_tk), 1_000);
+        assert_eq!(
+            ds_c.get_u128(&gmx_keys::pool_amount_key(&w.env, &w.market_tk, &w.long_tk)),
+            1_000
+        );
+        assert_eq!(balance(&w, &w.market_tk), 1_000);
+    }
+
+    /// A market override takes precedence over the protocol recipient, other
+    /// markets keep paying the protocol, and clearing the override falls back.
+    #[test]
+    fn market_override_routes_fees_and_clearing_falls_back_to_protocol() {
+        let w = setup();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        let partner = Address::generate(&w.env);
+        let other_market = Address::generate(&w.env);
+
+        fh.set_market_fee_receiver(&w.market_tk, &Some(partner.clone()));
+        assert_eq!(fh.get_fee_receiver(&w.market_tk), Some(partner.clone()));
+        assert_eq!(
+            fh.get_market_fee_receiver(&w.market_tk),
+            Some(partner.clone())
+        );
+        assert_eq!(fh.get_fee_receiver(&other_market), Some(w.treasury.clone()));
+        assert_eq!(fh.get_protocol_fee_receiver(), Some(w.treasury.clone()));
+
+        seed_fees(&w, &w.market_tk, 400);
+        fh.claim_fees(&w.keeper, &w.market_tk, &w.long_tk);
+        assert_eq!(balance(&w, &partner), 400);
+        assert_eq!(balance(&w, &w.treasury), 0);
+
+        fh.set_market_fee_receiver(&w.market_tk, &None);
+        assert_eq!(fh.get_market_fee_receiver(&w.market_tk), None);
+        assert_eq!(fh.get_fee_receiver(&w.market_tk), Some(w.treasury.clone()));
+
+        seed_fees(&w, &w.market_tk, 250);
+        fh.claim_fees(&w.keeper, &w.market_tk, &w.long_tk);
+        assert_eq!(balance(&w, &partner), 400);
+        assert_eq!(balance(&w, &w.treasury), 250);
+    }
+
+    /// Both setters require the stored admin's authorization — a recipient
+    /// change signed only by someone else is rejected and changes nothing.
+    #[test]
+    fn fee_receiver_setters_require_admin_auth() {
+        use soroban_sdk::testutils::{AuthorizedFunction, MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let w = setup();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        let attacker = Address::generate(&w.env);
+
+        // Positive path: the admin is the address whose auth the call demands.
+        let new_treasury = Address::generate(&w.env);
+        fh.set_fee_receiver(&new_treasury);
+        let auths = w.env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, w.admin);
+        assert_eq!(
+            auths[0].1.function,
+            AuthorizedFunction::Contract((
+                w.handler.clone(),
+                soroban_sdk::Symbol::new(&w.env, "set_fee_receiver"),
+                (new_treasury.clone(),).into_val(&w.env),
+            ))
+        );
+
+        // Negative paths: only the attacker signs.
+        assert!(fh
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &w.handler,
+                    fn_name: "set_fee_receiver",
+                    args: (attacker.clone(),).into_val(&w.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_fee_receiver(&attacker)
+            .is_err());
+        let override_to: Option<Address> = Some(attacker.clone());
+        assert!(fh
+            .mock_auths(&[MockAuth {
+                address: &attacker,
+                invoke: &MockAuthInvoke {
+                    contract: &w.handler,
+                    fn_name: "set_market_fee_receiver",
+                    args: (w.market_tk.clone(), override_to.clone()).into_val(&w.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_set_market_fee_receiver(&w.market_tk, &override_to)
+            .is_err());
+
+        assert_eq!(fh.get_protocol_fee_receiver(), Some(new_treasury.clone()));
+        assert_eq!(fh.get_fee_receiver(&w.market_tk), Some(new_treasury));
+    }
+
+    /// A recipient may not be the market pool or the handler: either would
+    /// decrement `pool_amount` without the tokens actually leaving.
+    #[test]
+    fn fee_receiver_rejects_pool_and_handler_addresses() {
+        let w = setup();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+
+        let err = fh.try_set_fee_receiver(&w.handler).unwrap_err().unwrap();
+        assert_err(err, Error::InvalidFeeReceiver);
+        let err = fh
+            .try_set_market_fee_receiver(&w.market_tk, &Some(w.market_tk.clone()))
+            .unwrap_err()
+            .unwrap();
+        assert_err(err, Error::InvalidFeeReceiver);
+        let err = fh
+            .try_set_market_fee_receiver(&w.market_tk, &Some(w.handler.clone()))
+            .unwrap_err()
+            .unwrap();
+        assert_err(err, Error::InvalidFeeReceiver);
+        assert_eq!(fh.get_fee_receiver(&w.market_tk), Some(w.treasury.clone()));
+    }
+
+    /// The protocol recipient cannot be checked against every market when it is
+    /// set, so `claim_fees` refuses a market whose resolved recipient is itself.
+    #[test]
+    fn claim_fees_rejects_protocol_receiver_equal_to_market() {
+        let w = setup();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        fh.set_fee_receiver(&w.market_tk);
+        seed_fees(&w, &w.market_tk, 1_000);
+
+        let err = fh
+            .try_claim_fees(&w.keeper, &w.market_tk, &w.long_tk)
+            .unwrap_err()
+            .unwrap();
+        assert_err(err, Error::InvalidFeeReceiver);
+        assert_eq!(fh.claimable_fees(&w.market_tk, &w.long_tk), 1_000);
+    }
+
+    /// Every recipient change publishes `FeeReceiverSet` with the previous and
+    /// new values, so the full history is reconstructable from events.
+    #[test]
+    fn fee_receiver_changes_emit_audit_events() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::Event as _;
+
+        let w = setup_without_fee_receiver();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        let treasury_2 = Address::generate(&w.env);
+        let partner = Address::generate(&w.env);
+
+        let expect =
+            |market: Option<Address>, previous: Option<Address>, receiver: Option<Address>| {
+                assert_eq!(
+                    w.env.events().all().filter_by_contract(&w.handler),
+                    [FeeReceiverSet {
+                        market,
+                        previous,
+                        receiver,
+                    }
+                    .to_xdr(&w.env, &w.handler)]
+                );
+            };
+
+        fh.set_fee_receiver(&w.treasury);
+        expect(None, None, Some(w.treasury.clone()));
+
+        fh.set_fee_receiver(&treasury_2);
+        expect(None, Some(w.treasury.clone()), Some(treasury_2.clone()));
+
+        fh.set_market_fee_receiver(&w.market_tk, &Some(partner.clone()));
+        expect(Some(w.market_tk.clone()), None, Some(partner.clone()));
+
+        fh.set_market_fee_receiver(&w.market_tk, &None);
+        expect(Some(w.market_tk.clone()), Some(partner), None);
     }
 
     // ── Issue #110: upgrade smoke tests ───────────────────────────────────────
@@ -1191,13 +1548,8 @@ mod tests {
         FeeHandlerClient::new(&w.env, &w.handler).upgrade(&BytesN::from_array(&w.env, &[0u8; 32]));
 
         // claim_fees must still work — fee is still in DataStore.
-        let receiver = Address::generate(&w.env);
-        FeeHandlerClient::new(&w.env, &w.handler).claim_fees(
-            &w.keeper,
-            &w.market_tk,
-            &w.long_tk,
-            &receiver,
-        );
+        let receiver = w.treasury.clone();
+        FeeHandlerClient::new(&w.env, &w.handler).claim_fees(&w.keeper, &w.market_tk, &w.long_tk);
 
         let bal = soroban_sdk::token::Client::new(&w.env, &w.long_tk).balance(&receiver);
         assert_eq!(

@@ -143,14 +143,36 @@ Delegates to `order_handler::liquidate_position` after health check. No direct t
 
 | Step | Action | Type |
 |------|--------|------|
-| 1 | Read claimable amount from DataStore | State read |
-| 2 | Compute capped transfer amount | Arithmetic |
-| 3 | **Zero out claimable amount in DataStore** | **State write (first)** |
-| 4 | `market_token.withdraw_from_pool` → receiver | External transfer |
+| 1 | Resolve the trusted fee recipient (market override, else protocol recipient) | State read |
+| 2 | Read claimable amount from DataStore | State read |
+| 3 | Compute capped transfer amount | Arithmetic |
+| 4 | **Zero out claimable amount in DataStore** | **State write (first)** |
+| 5 | `market_token.withdraw_from_pool` → configured recipient | External transfer |
 
-**Finding:** ✅ **Fully CEI compliant.** The claimable balance is zeroed (step 3) before the external transfer (step 4). A re-entrant `claim_fees` call would read zero and return early.
+**Finding:** ✅ **Fully CEI compliant.** The claimable balance is zeroed (step 4) before the external transfer (step 5). A re-entrant `claim_fees` call would read zero and return early.
 
-**Risk:** NONE — correct CEI ordering.
+**Destination:** `claim_fees(keeper, market, token)` takes no destination argument, and neither does
+`fee_batch_sweeper::claim_all_fees`. Protocol fees are paid only to the recipient held in
+`fee_handler`'s own storage:
+
+| Setting | Entrypoint | Auth | Event |
+|---|---|---|---|
+| Protocol recipient (treasury) | `set_fee_receiver(receiver)` | stored admin | `fee_rcv` `FeeReceiverSet { market: None, previous, receiver }` |
+| Per-market override (issuer / partner) | `set_market_fee_receiver(market, Some(receiver) \| None)` | stored admin | `fee_rcv` `FeeReceiverSet { market: Some(market), previous, receiver }` |
+
+Reads: `get_fee_receiver(market)` (the recipient that will actually be paid),
+`get_protocol_fee_receiver()`, `get_market_fee_receiver(market)`.
+
+- With no recipient configured, `claim_fees` reverts with `FeeReceiverNotSet` (#7) and fees stay claimable.
+- A recipient equal to the market pool or to `fee_handler` is rejected with `InvalidFeeReceiver` (#8),
+  both when it is set and when a claim resolves it. Paying the pool itself would decrement
+  `pool_amount` while the tokens never leave the pool.
+- Accrual is unchanged: settlement credits `claimable_fee_amount(market, token)` in DataStore, a key
+  derived from the market only. No order or create-order parameter (`receiver`, `swap_path`,
+  `on_behalf_of`, …) influences where protocol fees accrue or where they are paid.
+- v1 pays each market to a single recipient. Splits are not supported.
+
+**Risk:** NONE — correct CEI ordering; destination is trusted configuration only.
 
 ---
 

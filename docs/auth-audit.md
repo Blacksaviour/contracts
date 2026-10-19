@@ -263,19 +263,24 @@ File: `contracts/fee_handler/src/lib.rs`
 
 | Function | Expected Auth | Status | Notes |
 |---|---|---|---|
-| `initialize` | caller/admin/keeper | ✅ PASS | line 157, before state change |
-| `claimable_fees` | read-only | ➖ N/A | line 176, read-only |
-| `claim_fees` | caller/admin/keeper | ✅ PASS | line 195, before state change |
-| `set_auto_compound` | caller/admin/keeper | ✅ PASS | line 285, before state change |
-| `is_auto_compound` | read-only | ➖ N/A | line 305, read-only |
-| `record_fee_accrual` | caller/admin/keeper | ✅ PASS | line 316, before state change |
-| `upgrade` | caller/admin/keeper | ✅ PASS | line 346, before state change |
-| `claimable_ui_fees` | read-only | ➖ N/A | line 359, read-only |
-| `accrue_ui_fee` | caller/admin/keeper | ✅ PASS | line 380, before state change |
-| `claim_ui_fees` | caller/admin/keeper | ✅ PASS | line 428, before state change |
-| `claim_funding_fees` | caller/admin/keeper | ✅ PASS | line 471, before state change |
-| `get_ui_fee_factor` | read-only | ➖ N/A | line 514, read-only |
-| `set_ui_fee_factor` | caller/admin/keeper | ✅ PASS | line 527, before state change |
+| `initialize` | caller/admin/keeper | ✅ PASS | line 218, before state change |
+| `claimable_fees` | read-only | ➖ N/A | line 237, read-only |
+| `claim_fees` | caller/admin/keeper | ✅ PASS | line 262, before state change |
+| `get_fee_receiver` | read-only | ➖ N/A | line 351, read-only |
+| `get_protocol_fee_receiver` | read-only | ➖ N/A | line 356, read-only |
+| `get_market_fee_receiver` | read-only | ➖ N/A | line 361, read-only |
+| `set_fee_receiver` | caller/admin/keeper | ✅ PASS | line 368, before state change |
+| `set_market_fee_receiver` | caller/admin/keeper | ✅ PASS | line 388, before state change |
+| `set_auto_compound` | caller/admin/keeper | ✅ PASS | line 420, before state change |
+| `is_auto_compound` | read-only | ➖ N/A | line 440, read-only |
+| `record_fee_accrual` | caller/admin/keeper | ✅ PASS | line 451, before state change |
+| `upgrade` | caller/admin/keeper | ✅ PASS | line 481, before state change |
+| `claimable_ui_fees` | read-only | ➖ N/A | line 494, read-only |
+| `accrue_ui_fee` | caller/admin/keeper | ✅ PASS | line 515, before state change |
+| `claim_ui_fees` | caller/admin/keeper | ✅ PASS | line 563, before state change |
+| `claim_funding_fees` | caller/admin/keeper | ✅ PASS | line 606, before state change |
+| `get_ui_fee_factor` | read-only | ➖ N/A | line 649, read-only |
+| `set_ui_fee_factor` | caller/admin/keeper | ✅ PASS | line 662, before state change |
 
 ---
 
@@ -285,7 +290,7 @@ File: `contracts/fee_batch_sweeper/src/lib.rs`
 
 | Function | Expected Auth | Status | Notes |
 |---|---|---|---|
-| `claim_all_fees` | caller/admin/keeper | ✅ PASS | line 55, before state change |
+| `claim_all_fees` | caller/admin/keeper | ✅ PASS | line 57, before state change |
 
 ---
 
@@ -377,14 +382,16 @@ File: `contracts/order_cleanup/src/lib.rs`
 
 | Function | Expected Auth | Status | Notes |
 |---|---|---|---|
-| `initialize` | caller/admin/keeper | ✅ PASS | line 78, before state change |
-| `set_order_expiry` | caller/admin/keeper | ✅ PASS | line 90, before state change |
-| `cancel_expired_order` | caller/admin/keeper | ✅ PASS | line 104, before state change |
-| `record_manual_refund` | caller/admin/keeper | ✅ PASS | line 140, before state change |
-| `preview_expired_order` | read-only | ➖ N/A | line 168, read-only |
-| `get_u128` | read-only | ➖ N/A | line 274, read-only |
-| `get_order` | read-only | ➖ N/A | line 283, read-only |
-| `cleanup_expired_order` | read-only | ➖ N/A | line 300, read-only |
+| `initialize` | caller/admin/keeper | ✅ PASS | line 79, before state change |
+| `set_order_expiry` | caller/admin/keeper | ✅ PASS | line 91, before state change |
+| `cancel_expired_order` | caller/admin/keeper | ✅ PASS | line 105, before state change |
+| `record_manual_refund` | caller/admin/keeper | ✅ PASS | line 141, before state change |
+| `preview_expired_order` | read-only | ➖ N/A | line 169, read-only |
+| `clean_expired_order` | read-only | ➖ N/A | line 206, read-only |
+| `clean_expired_orders_batch` | read-only | ➖ N/A | line 241, read-only |
+| `get_u128` | read-only | ➖ N/A | line 350, read-only |
+| `get_order` | read-only | ➖ N/A | line 359, read-only |
+| `cleanup_expired_order` | read-only | ➖ N/A | line 376, read-only |
 
 ---
 
@@ -515,7 +522,7 @@ File: `contracts/test_token/src/lib.rs`
 
 | Total public functions audited | Auth-bearing | Read-only (N/A) | PASS | FAIL |
 |---|---|---|---|---|
-| 283 | 164 | 119 | **164** | **0** |
+| 290 | 166 | 124 | **166** | **0** |
 
 All `require_auth` call-sites fire **before** any storage read or write that could be influenced by the caller's identity. No failures were identified. No linked bug issues are raised.
 
