@@ -428,3 +428,20 @@ mod tests {
         assert_eq!(price.pick_price(false), 100);
     }
 }
+
+// ─── Protocol modules ─────────────────────────────────────────────────────────
+pub mod errors;
+pub mod market_state;
+pub mod event_schema;
+
+pub use errors::ProtocolError;
+pub use market_state::{MarketState, TransitionAuthority, validate_state_transition};
+pub use event_schema::{
+    EVENT_SCHEMA_VERSION,
+    MarketStateTransitionEvent,
+    OrderCreatedEvent, OrderExecutedEvent, OrderCancelledEvent,
+    PositionIncreasedEvent, PositionDecreasedEvent, PositionLiquidatedEvent,
+    DepositCreatedEvent, DepositExecutedEvent,
+    WithdrawalCreatedEvent, WithdrawalExecutedEvent,
+    FundingRateUpdatedEvent, TransactionRejectedEvent,
+};
