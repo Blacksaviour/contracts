@@ -116,7 +116,15 @@ path = "resource_bench.rs"
 [[test]]
 name = "clob_model"
 path = "clob_model.rs"
+
+[[test]]
 name = "clob_properties"
 path = "clob_properties.rs"
+
+[[test]]
 name = "privileged_auth_matrix"
 path = "privileged_auth_matrix.rs"
+
+[[test]]
+name = "fee_receiver_routing"
+path = "fee_receiver_routing.rs"

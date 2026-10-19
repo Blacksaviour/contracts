@@ -431,17 +431,14 @@ mod tests {
 
 // ─── Protocol modules ─────────────────────────────────────────────────────────
 pub mod errors;
-pub mod market_state;
 pub mod event_schema;
+pub mod market_state;
 
 pub use errors::ProtocolError;
-pub use market_state::{MarketState, TransitionAuthority, validate_state_transition};
 pub use event_schema::{
-    EVENT_SCHEMA_VERSION,
-    MarketStateTransitionEvent,
-    OrderCreatedEvent, OrderExecutedEvent, OrderCancelledEvent,
-    PositionIncreasedEvent, PositionDecreasedEvent, PositionLiquidatedEvent,
-    DepositCreatedEvent, DepositExecutedEvent,
-    WithdrawalCreatedEvent, WithdrawalExecutedEvent,
-    FundingRateUpdatedEvent, TransactionRejectedEvent,
+    DepositCreatedEvent, DepositExecutedEvent, FundingRateUpdatedEvent, MarketStateTransitionEvent,
+    OrderCancelledEvent, OrderCreatedEvent, OrderExecutedEvent, PositionDecreasedEvent,
+    PositionIncreasedEvent, PositionLiquidatedEvent, TransactionRejectedEvent,
+    WithdrawalCreatedEvent, WithdrawalExecutedEvent, EVENT_SCHEMA_VERSION,
 };
+pub use market_state::{validate_state_transition, MarketState, TransitionAuthority};

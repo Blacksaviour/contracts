@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 soroban-sdk = { workspace = true }
-gmx_types = { path = "../types" }
+gmx-types = { path = "../types" }
 settlement_invariants = { path = "../settlement_invariants" }
 
 [dev-dependencies]
