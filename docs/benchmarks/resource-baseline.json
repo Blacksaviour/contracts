@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "meta": {
-    "rationale": "Initial resource baseline for the CI regression gate (#1064): soroban-sdk 25.3.1, native contract registration.",
-    "updated": "2026-10-16"
+    "rationale": "Add fees/set_fee_receiver, fees/set_market_fee_receiver and fees/claim_fees scenarios for the constrained fee-recipient model; existing scenarios unchanged. Recorded from CI run 39335378079 (ubuntu, soroban-sdk 25.3.1).",
+    "updated": "2026-10-19"
   },
   "thresholds": {
     "instructions": {
@@ -95,6 +95,39 @@
       "write_bytes": 4884,
       "contract_events_size_bytes": 1380,
       "fee_total_stroops": 3577120
+    },
+    "fees/claim_fees": {
+      "instructions": 994709,
+      "mem_bytes": 212081,
+      "disk_read_entries": 1,
+      "memory_read_entries": 15,
+      "write_entries": 5,
+      "disk_read_bytes": 92,
+      "write_bytes": 800,
+      "contract_events_size_bytes": 700,
+      "fee_total_stroops": 2033352
+    },
+    "fees/set_fee_receiver": {
+      "instructions": 103444,
+      "mem_bytes": 28084,
+      "disk_read_entries": 0,
+      "memory_read_entries": 3,
+      "write_entries": 2,
+      "disk_read_bytes": 0,
+      "write_bytes": 512,
+      "contract_events_size_bytes": 176,
+      "fee_total_stroops": 1324611
+    },
+    "fees/set_market_fee_receiver": {
+      "instructions": 129327,
+      "mem_bytes": 38519,
+      "disk_read_entries": 0,
+      "memory_read_entries": 4,
+      "write_entries": 2,
+      "disk_read_bytes": 0,
+      "write_bytes": 248,
+      "contract_events_size_bytes": 212,
+      "fee_total_stroops": 1830717
     },
     "lifecycle/create_deposit": {
       "instructions": 1789986,
