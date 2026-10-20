@@ -1,5 +1,5 @@
 // CLOB Settlement, Accounting, Fees, and Order Lifecycle Implementation
-// Addresses issues #957, #958, #959, #962, #964, #965, #967, #981
+// Addresses issues #957, #958, #959, #960, #961, #962, #963, #964, #965, #967, #981
 
 #![no_std]
 use soroban_sdk::{Address, Env, i128};
@@ -7,6 +7,10 @@ use soroban_sdk::{Address, Env, i128};
 /// Fixed-point denominator used for protocol fee rates.
 /// A rate of 100_000 (0.1%) is represented as 100_000 / FEE_RATE_SCALE.
 pub const FEE_RATE_SCALE: i128 = 100_000_000;
+
+/// Protocol maximum for any maker or taker rate. Market configuration must not
+/// exceed it. A rate of zero means that side pays no fee.
+pub const MAX_FEE_RATE: i128 = FEE_RATE_SCALE;
 
 // ============ #957: Base and Quote Balance Transfers ============
 #[derive(Clone)]
@@ -29,8 +33,23 @@ pub struct SettlementLedger {
 impl SettlementLedger {
     fn add_fee_liability(&mut self, token: Address, amount: i128) -> Result<(), &'static str> {
         if amount < 0 { return Err("fee: negative accrual"); }
-        self.fee_liabilities.push((token, amount));
+        // A zero fee leaves no entry, so zero-fee markets have no hidden deductions.
+        if amount > 0 { self.fee_liabilities.push((token, amount)); }
         Ok(())
+    }
+}
+
+/// Protocol fees owed for one fill, in quote atoms. Both amounts belong to the
+/// protocol, never to a trader.
+#[derive(Clone, Copy)]
+pub struct FillFees {
+    pub taker: i128,
+    pub maker: i128,
+}
+
+impl FillFees {
+    pub fn total(&self) -> Result<i128, &'static str> {
+        self.taker.checked_add(self.maker).ok_or("fee: total overflow")
     }
 }
 
@@ -54,39 +73,36 @@ impl Fill {
         Ok(())
     }
 
-    /// Settle a fill and its taker fee as one ledger operation.  The fee is
-    /// deducted from the taker's quote side and recorded as a protocol
-    /// liability; it is never added to a trader's available balance.
+    /// Fees owed for this fill. `taker_quote_before` is the quote the same taker
+    /// already filled earlier in the transaction (zero for its first fill), so
+    /// the taker fee is charged on the running total, not on each fragment.
+    pub fn fees(
+        &self,
+        config: &MarketFeeConfig,
+        taker_quote_before: i128,
+    ) -> Result<FillFees, &'static str> {
+        if self.base_amount < 0 || self.quote_amount < 0 {
+            return Err("fill: amounts must be non-negative");
+        }
+        Ok(FillFees {
+            taker: config.cumulative_taker_fee_delta(taker_quote_before, self.quote_amount)?,
+            maker: config.maker_fee(self.quote_amount)?,
+        })
+    }
+
+    /// Settle a fill and its fees as one ledger operation.  Fees are deducted
+    /// from each trader's quote side and recorded as protocol liabilities; they
+    /// are never added to a trader's available balance.
     pub fn settle_with_fee(
         &self,
         ledger: &mut SettlementLedger,
         config: &MarketFeeConfig,
         quote_token: Address,
-    ) -> Result<i128, &'static str> {
-        if self.base_amount < 0 || self.quote_amount < 0 {
-            return Err("fill: amounts must be non-negative");
-        }
-        let fee = config.taker_fee(self.quote_amount)?;
-        // Stage all mutations so an overflow or conservation failure leaves
-        // the caller's economic state untouched.
-        let mut staged = ledger.clone();
-        if self.maker_is_sell {
-            staged.base_transfers.push((self.maker.clone(), -self.base_amount));
-            staged.quote_transfers.push((self.maker.clone(), self.quote_amount));
-            staged.base_transfers.push((self.taker.clone(), self.base_amount));
-            let taker_quote = self.quote_amount.checked_add(fee).ok_or("fee: quote overflow")?;
-            staged.quote_transfers.push((self.taker.clone(), -taker_quote));
-        } else {
-            staged.quote_transfers.push((self.maker.clone(), -self.quote_amount));
-            staged.base_transfers.push((self.maker.clone(), self.base_amount));
-            staged.quote_transfers.push((self.taker.clone(), self.quote_amount.checked_sub(fee)
-                .ok_or("fee: quote underflow")?));
-            staged.base_transfers.push((self.taker.clone(), -self.base_amount));
-        }
-        staged.add_fee_liability(quote_token, fee)?;
-        Self::validate_conservation(&staged)?;
-        *ledger = staged;
-        Ok(fee)
+        taker_quote_before: i128,
+    ) -> Result<FillFees, &'static str> {
+        let fees = self.fees(config, taker_quote_before)?;
+        self.settle_with_fees(ledger, fees, quote_token)?;
+        Ok(fees)
     }
 
     /// Variant used by the contract settlement path. The accumulator is
@@ -97,17 +113,59 @@ impl Fill {
         ledger: &mut SettlementLedger,
         accumulator: &mut FeeAccumulator,
         config: &MarketFeeConfig,
-    ) -> Result<i128, &'static str> {
-        let fee = config.taker_fee(self.quote_amount)?;
+        taker_quote_before: i128,
+    ) -> Result<FillFees, &'static str> {
+        let fees = self.fees(config, taker_quote_before)?;
+        let total = fees.total()?;
         accumulator
             .accrued
-            .checked_add(fee)
+            .checked_add(total)
             .ok_or("fee: accumulator overflow")?;
-        let settled_fee = self.settle_with_fee(ledger, config, accumulator.token.clone())?;
+        self.settle_with_fees(ledger, fees, accumulator.token.clone())?;
         // The preflight above proves this cannot fail now.
-        accumulator.accrued = accumulator.accrued.checked_add(settled_fee)
+        accumulator.accrued = accumulator.accrued.checked_add(total)
             .ok_or("fee: accumulator overflow")?;
-        Ok(settled_fee)
+        Ok(fees)
+    }
+
+    fn settle_with_fees(
+        &self,
+        ledger: &mut SettlementLedger,
+        fees: FillFees,
+        quote_token: Address,
+    ) -> Result<(), &'static str> {
+        // Stage all mutations so an overflow or conservation failure leaves
+        // the caller's economic state untouched.
+        let mut staged = ledger.clone();
+        let quote = self.quote_amount;
+        // The maker's fee is taken from its own leg: a seller receives quote net
+        // of the fee, a buyer pays quote plus the fee. The taker's leg mirrors it.
+        let maker_quote = if self.maker_is_sell {
+            quote.checked_sub(fees.maker)
+        } else {
+            quote.checked_add(fees.maker).and_then(|v| v.checked_neg())
+        }
+        .ok_or("fee: maker quote overflow")?;
+        let taker_quote = if self.maker_is_sell {
+            quote.checked_add(fees.taker).and_then(|v| v.checked_neg())
+        } else {
+            quote.checked_sub(fees.taker)
+        }
+        .ok_or("fee: taker quote overflow")?;
+        if self.maker_is_sell {
+            staged.base_transfers.push((self.maker.clone(), -self.base_amount));
+            staged.base_transfers.push((self.taker.clone(), self.base_amount));
+        } else {
+            staged.base_transfers.push((self.maker.clone(), self.base_amount));
+            staged.base_transfers.push((self.taker.clone(), -self.base_amount));
+        }
+        staged.quote_transfers.push((self.maker.clone(), maker_quote));
+        staged.quote_transfers.push((self.taker.clone(), taker_quote));
+        staged.add_fee_liability(quote_token.clone(), fees.taker)?;
+        staged.add_fee_liability(quote_token, fees.maker)?;
+        Self::validate_conservation(&staged)?;
+        *ledger = staged;
+        Ok(())
     }
     
     pub fn validate_conservation(ledger: &SettlementLedger) -> Result<(), &'static str> {
@@ -135,43 +193,66 @@ impl Fill {
 }
 
 /// Market-wide v1 fee configuration.  The lookup is O(1) and does not depend
-/// on historical volume or any unbounded trader scan.
+/// on historical volume or any unbounded trader scan.  Both rates are fixed
+/// point over `FEE_RATE_SCALE` and non-negative: maker rebates are out of
+/// scope for v1.
 #[derive(Clone, Copy)]
 pub struct MarketFeeConfig {
     pub taker_fee_rate: i128,
+    pub maker_fee_rate: i128,
 }
 
 impl MarketFeeConfig {
-    pub fn new(taker_fee_rate: i128) -> Result<Self, &'static str> {
-        if taker_fee_rate < 0 || taker_fee_rate > FEE_RATE_SCALE {
-            return Err("fee: rate out of range");
-        }
-        Ok(Self { taker_fee_rate })
+    pub fn new(taker_fee_rate: i128, maker_fee_rate: i128) -> Result<Self, &'static str> {
+        validate_fee_rate(taker_fee_rate)?;
+        validate_fee_rate(maker_fee_rate)?;
+        Ok(Self { taker_fee_rate, maker_fee_rate })
     }
 
+    /// Fee charged to the taker on a fill of `quote_amount`, rounded up.
     pub fn taker_fee(&self, quote_amount: i128) -> Result<i128, &'static str> {
-        if quote_amount < 0 { return Err("fee: negative quote amount"); }
-        let numerator = quote_amount.checked_mul(self.taker_fee_rate)
-            .ok_or("fee: multiplication overflow")?;
-        // Fees round up so a non-zero obligation can never be under-reserved.
-        if numerator == 0 { return Ok(0); }
-        numerator.checked_add(FEE_RATE_SCALE - 1)
-            .ok_or("fee: rounding overflow")
-            .map(|n| n / FEE_RATE_SCALE)
+        fee_on_quote(quote_amount, self.taker_fee_rate)
     }
 
+    /// Fee charged to the maker on a fill of `quote_amount`, rounded up.
+    pub fn maker_fee(&self, quote_amount: i128) -> Result<i128, &'static str> {
+        fee_on_quote(quote_amount, self.maker_fee_rate)
+    }
+
+    /// Taker fee for a fill that takes the taker's running total from
+    /// `taker_quote_before` to `taker_quote_before + fill_quote`.  The fee is the
+    /// difference of two rounded-up totals, so the fees of consecutive fills sum
+    /// to the fee of their total: splitting a fill never changes the fee.
+    pub fn cumulative_taker_fee_delta(
+        &self,
+        taker_quote_before: i128,
+        fill_quote: i128,
+    ) -> Result<i128, &'static str> {
+        if fill_quote < 0 { return Err("fee: negative quote amount"); }
+        let before = self.taker_fee(taker_quote_before)?;
+        let total = taker_quote_before
+            .checked_add(fill_quote)
+            .ok_or("fee: cumulative quote overflow")?;
+        self.taker_fee(total)?
+            .checked_sub(before)
+            .ok_or("fee: cumulative underflow")
+    }
+
+    /// Quote a bid must lock to cover its quote and the larger of its maker and
+    /// taker fees.  A resting bid can be filled as a maker later, so its lock
+    /// cannot assume the taker role.
     pub fn required_bid_reservation(&self, quote_amount: i128) -> Result<i128, &'static str> {
-        let fee = self.taker_fee(quote_amount)?;
+        let fee = self.taker_fee(quote_amount)?.max(self.maker_fee(quote_amount)?);
         quote_amount.checked_add(fee).ok_or("fee: reservation overflow")
     }
 
     /// Resolve one already-authorized bounded tier. `None` is the unambiguous
-    /// v1 default and uses the market-wide rate.
+    /// v1 default and uses the market-wide rate. A tier replaces only the taker rate.
     pub fn resolve_tier(&self, tier: Option<FeeTier>) -> Result<Self, &'static str> {
         match tier {
             Some(tier) => {
                 tier.validate()?;
-                Ok(Self { taker_fee_rate: tier.taker_fee_rate })
+                Ok(Self { taker_fee_rate: tier.taker_fee_rate, ..*self })
             }
             None => Ok(*self),
         }
@@ -188,11 +269,26 @@ pub struct FeeTier {
 
 impl FeeTier {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.taker_fee_rate < 0 || self.taker_fee_rate > FEE_RATE_SCALE {
-            return Err("fee: tier rate out of range");
-        }
-        Ok(())
+        validate_fee_rate(self.taker_fee_rate)
     }
+}
+
+fn validate_fee_rate(rate: i128) -> Result<(), &'static str> {
+    if rate < 0 || rate > MAX_FEE_RATE {
+        return Err("fee: rate out of range");
+    }
+    Ok(())
+}
+
+/// Fee on `quote_amount` at `rate`, rounded up so a non-zero obligation can
+/// never be under-reserved.  A zero rate charges nothing.
+fn fee_on_quote(quote_amount: i128, rate: i128) -> Result<i128, &'static str> {
+    if quote_amount < 0 { return Err("fee: negative quote amount"); }
+    let numerator = quote_amount.checked_mul(rate).ok_or("fee: multiplication overflow")?;
+    if numerator == 0 { return Ok(0); }
+    numerator.checked_add(FEE_RATE_SCALE - 1)
+        .ok_or("fee: rounding overflow")
+        .map(|n| n / FEE_RATE_SCALE)
 }
 
 // ============ #958: Fee Buckets ============
@@ -482,31 +578,167 @@ mod fee_tests {
 
     #[test]
     fn reservation_rounds_fee_up() {
-        let config = MarketFeeConfig::new(1).unwrap();
+        let config = MarketFeeConfig::new(1, 0).unwrap();
         assert_eq!(config.taker_fee(1).unwrap(), 1);
         assert_eq!(config.required_bid_reservation(1).unwrap(), 2);
     }
 
     #[test]
     fn zero_fee_has_no_extra_reservation() {
-        let config = MarketFeeConfig::new(0).unwrap();
+        let config = MarketFeeConfig::new(0, 0).unwrap();
         assert_eq!(config.required_bid_reservation(123).unwrap(), 123);
     }
 
     #[test]
     fn invalid_rates_and_overflow_are_rejected() {
-        assert!(MarketFeeConfig::new(-1).is_err());
-        assert!(MarketFeeConfig::new(FEE_RATE_SCALE + 1).is_err());
-        let config = MarketFeeConfig::new(FEE_RATE_SCALE).unwrap();
+        assert!(MarketFeeConfig::new(-1, 0).is_err());
+        assert!(MarketFeeConfig::new(0, -1).is_err());
+        assert!(MarketFeeConfig::new(FEE_RATE_SCALE + 1, 0).is_err());
+        assert!(MarketFeeConfig::new(0, MAX_FEE_RATE + 1).is_err());
+        let config = MarketFeeConfig::new(MAX_FEE_RATE, 0).unwrap();
         assert!(config.required_bid_reservation(i128::MAX).is_err());
     }
 
     #[test]
     fn tier_resolution_is_bounded_and_default_is_explicit() {
-        let config = MarketFeeConfig::new(100).unwrap();
+        let config = MarketFeeConfig::new(100, 50).unwrap();
         assert_eq!(config.resolve_tier(None).unwrap().taker_fee_rate, 100);
         let tier = FeeTier { id: 7, taker_fee_rate: 200 };
-        assert_eq!(config.resolve_tier(Some(tier)).unwrap().taker_fee_rate, 200);
+        let resolved = config.resolve_tier(Some(tier)).unwrap();
+        assert_eq!(resolved.taker_fee_rate, 200);
+        assert_eq!(resolved.maker_fee_rate, 50);
+    }
+
+    #[test]
+    fn bid_reservation_covers_the_larger_of_maker_and_taker_fee() {
+        // 0.1% taker fee and 0.2% maker fee: the maker fee is the larger obligation.
+        let config = MarketFeeConfig::new(100_000, 200_000).unwrap();
+        assert_eq!(config.taker_fee(1_000).unwrap(), 1);
+        assert_eq!(config.maker_fee(1_000).unwrap(), 2);
+        assert_eq!(config.required_bid_reservation(1_000).unwrap(), 1_002);
+    }
+
+    #[test]
+    fn split_taker_fills_pay_the_fee_of_their_total() {
+        // A one-atom fill alone rounds its fee up to one atom. Three one-atom
+        // fills must still pay one atom in total, not three.
+        let config = MarketFeeConfig::new(1, 0).unwrap();
+        let mut filled = 0;
+        let mut paid = 0;
+        for _ in 0..3 {
+            paid += config.cumulative_taker_fee_delta(filled, 1).unwrap();
+            filled += 1;
+        }
+        assert_eq!(config.taker_fee(3).unwrap(), 1);
+        assert_eq!(paid, 1);
+    }
+}
+
+#[cfg(test)]
+mod fee_settlement_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn empty_ledger() -> SettlementLedger {
+        SettlementLedger {
+            base_transfers: Vec::new(),
+            quote_transfers: Vec::new(),
+            fee_liabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn maker_sell_pays_maker_fee_from_its_proceeds() {
+        let env = Env::default();
+        let quote_token = Address::generate(&env);
+        // 0.1% taker fee and 0.05% maker fee.
+        let config = MarketFeeConfig::new(100_000, 50_000).unwrap();
+        let fill = Fill {
+            maker: Address::generate(&env),
+            taker: Address::generate(&env),
+            base_amount: 10,
+            quote_amount: 1_000_000,
+            maker_is_sell: true,
+        };
+        let mut ledger = empty_ledger();
+        let mut accumulator = FeeAccumulator::new(quote_token);
+        let fees = fill
+            .settle_with_fee_and_accumulator(&mut ledger, &mut accumulator, &config, 0)
+            .unwrap();
+        assert_eq!(fees.taker, 1_000);
+        assert_eq!(fees.maker, 500);
+        // The seller receives quote net of its fee; the buyer pays quote plus its fee.
+        assert_eq!(ledger.quote_transfers[0].1, 999_500);
+        assert_eq!(ledger.quote_transfers[1].1, -1_001_000);
+        assert_eq!(accumulator.accrued, 1_500);
+    }
+
+    #[test]
+    fn maker_buy_pays_quote_plus_fee_and_taker_seller_nets_its_fee() {
+        let env = Env::default();
+        let config = MarketFeeConfig::new(100_000, 50_000).unwrap();
+        let fill = Fill {
+            maker: Address::generate(&env),
+            taker: Address::generate(&env),
+            base_amount: 10,
+            quote_amount: 1_000_000,
+            maker_is_sell: false,
+        };
+        let mut ledger = empty_ledger();
+        let fees = fill
+            .settle_with_fee(&mut ledger, &config, Address::generate(&env), 0)
+            .unwrap();
+        assert_eq!(fees.total().unwrap(), 1_500);
+        assert_eq!(ledger.base_transfers[0].1, 10);
+        assert_eq!(ledger.quote_transfers[0].1, -1_000_500);
+        assert_eq!(ledger.quote_transfers[1].1, 999_000);
+    }
+
+    #[test]
+    fn zero_fee_market_has_no_liability_and_no_deduction() {
+        let env = Env::default();
+        let config = MarketFeeConfig::new(0, 0).unwrap();
+        let fill = Fill {
+            maker: Address::generate(&env),
+            taker: Address::generate(&env),
+            base_amount: 10,
+            quote_amount: 1_000_000,
+            maker_is_sell: true,
+        };
+        let mut ledger = empty_ledger();
+        let fees = fill
+            .settle_with_fee(&mut ledger, &config, Address::generate(&env), 0)
+            .unwrap();
+        assert_eq!(fees.total().unwrap(), 0);
+        assert!(ledger.fee_liabilities.is_empty());
+        assert_eq!(ledger.quote_transfers[0].1, 1_000_000);
+        assert_eq!(ledger.quote_transfers[1].1, -1_000_000);
+    }
+
+    #[test]
+    fn split_fills_charge_one_taker_fee_in_total_through_settlement() {
+        let env = Env::default();
+        let quote_token = Address::generate(&env);
+        let config = MarketFeeConfig::new(1, 0).unwrap();
+        let taker = Address::generate(&env);
+        let mut ledger = empty_ledger();
+        let mut taker_quote_before = 0;
+        let mut taker_fees = 0;
+        for _ in 0..3 {
+            let fill = Fill {
+                maker: Address::generate(&env),
+                taker: taker.clone(),
+                base_amount: 1,
+                quote_amount: 1,
+                maker_is_sell: false,
+            };
+            let fees = fill
+                .settle_with_fee(&mut ledger, &config, quote_token.clone(), taker_quote_before)
+                .unwrap();
+            taker_fees += fees.taker;
+            taker_quote_before += 1;
+        }
+        assert_eq!(taker_fees, config.taker_fee(3).unwrap());
     }
 }
 
