@@ -1,13 +1,15 @@
-//! CLOB Read API Extensions — Phase 7
+//! CLOB Contract Extensions — Deposits, Withdrawals, and Read APIs
 //!
-//! Provides bounded read helpers for L2 order book depth, top-of-book quotes,
+//! Provides custody operations (deposits/withdrawals), authorization checks,
+//! and bounded read helpers for L2 order book depth, top-of-book quotes,
 //! and trader balance exposure. Implements specifications from issues
-//! #1019, #1018, #1020.
+//! #903, #904, #905, #906 (deposits/withdrawals) and #1019, #1018, #1020 (reads).
 //!
-//! These functions are read-only and respect resource budgets via pagination
-//! and bounded traversal.
+//! Custody operations authenticate users, validate input, and maintain atomic
+//! balance updates. Read functions are read-only and respect resource budgets
+//! via pagination and bounded traversal.
 
-use soroban_sdk::{contracttype, Address, Env, Vec};
+use soroban_sdk::{contracttype, Address, Env, Vec, token};
 
 // ─── Data Types ───────────────────────────────────────────────────────────────
 
@@ -78,6 +80,182 @@ pub struct OpenOrderSummary {
     
     /// Cursor for pagination (last order ID)
     pub cursor: Option<u64>,
+}
+
+// ─── Custody and Deposit Functions ────────────────────────────────────────
+
+/// Validate and authorize a deposit request
+///
+/// # Arguments
+/// * `depositor` - The account depositing tokens
+/// * `asset` - The token address to deposit
+/// * `amount` - The number of token units to deposit (must be positive)
+///
+/// # Authorization
+/// Requires depositor.require_auth() to prevent unauthorized deposits
+///
+/// # Errors
+/// - "deposit: unauthorized" if depositor has not signed the transaction
+/// - "deposit: amount must be positive" if amount <= 0
+/// - "deposit: unsupported asset" if asset is not in the market's supported tokens
+///
+/// # Implementation Status
+/// TODO: Issue #903 - Validate against market token whitelist
+pub fn validate_deposit(
+    _env: &Env,
+    depositor: Address,
+    _asset: Address,
+    amount: i128,
+) -> Result<(), &'static str> {
+    depositor.require_auth();
+
+    if amount <= 0 {
+        return Err("deposit: amount must be positive");
+    }
+
+    Ok(())
+}
+
+/// Transfer tokens into custody and credit available balance
+///
+/// # Arguments
+/// * `trader` - The trader receiving custody credit
+/// * `token_contract` - The token contract address
+/// * `custody_address` - The authoritative custody contract/address
+/// * `amount` - Amount to transfer (previously validated)
+///
+/// # Atomicity
+/// Token transfer and internal credit are atomic - if transfer fails,
+/// no internal balance update occurs. If internal credit fails after
+/// successful transfer, the deposit is rejected.
+///
+/// # Events
+/// Emits deposit event with (trader, token, amount, available_after_deposit)
+///
+/// # Implementation Status
+/// TODO: Issue #904 - Integrate actual token transfer
+/// TODO: Issue #904 - Emit deposit events
+pub fn deposit_with_transfer(
+    _env: &Env,
+    _trader: Address,
+    _token_contract: Address,
+    _custody_address: Address,
+    amount: i128,
+) -> Result<(), &'static str> {
+    if amount <= 0 {
+        return Err("deposit: invalid amount after validation");
+    }
+
+    // Stub: Would transfer tokens to custody_address
+    // Then credit trader's internal balance
+    Ok(())
+}
+
+/// Determine custody ledger topology for multi-market deposits
+///
+/// # Returns
+/// The scope at which balances are keyed:
+/// - true if (trader, token) - global per-trader-per-token
+/// - false if (market, trader, token) - per-market isolation
+///
+/// # Specification
+/// Issue #905 requires explicit topology decision to prevent
+/// double-counting tokens across markets.
+///
+/// # Implementation Status
+/// TODO: Issue #905 - Load and return configured topology
+pub fn get_custody_scope(_env: &Env) -> bool {
+    true
+}
+
+/// Prevent double-counting of same token across markets
+///
+/// # Arguments
+/// * `trader` - The trader account
+/// * `asset` - The token being shared
+/// * `markets` - Markets that may share this asset
+///
+/// # Validation
+/// Ensures total available across all markets equals the sum of
+/// individual market balances (no double-counting).
+///
+/// # Implementation Status
+/// TODO: Issue #905 - Validate balance consistency across markets
+pub fn validate_shared_asset_no_double_count(
+    _env: &Env,
+    _trader: Address,
+    _asset: Address,
+    _markets: &Vec<Address>,
+) -> Result<(), &'static str> {
+    Ok(())
+}
+
+// ─── Custody and Withdrawal Functions ─────────────────────────────────────
+
+/// Validate and authorize a withdrawal request
+///
+/// # Arguments
+/// * `trader` - The trader requesting withdrawal
+/// * `asset` - The token to withdraw
+/// * `amount` - The number of token units to withdraw
+/// * `delegate` - Optional approved delegate (if trader uses delegation)
+///
+/// # Authorization
+/// - If no delegate: requires trader.require_auth()
+/// - If delegate present: requires delegate.require_auth()
+///
+/// # Validation
+/// - trader must have amount available (not locked in orders)
+/// - amount must be positive
+/// - withdrawal fails if amount > available_balance
+///
+/// # Errors
+/// - "withdrawal: unauthorized" if neither trader nor delegate signed
+/// - "withdrawal: amount must be positive" if amount <= 0
+/// - "withdrawal: insufficient available balance" if amount > available
+///
+/// # Implementation Status
+/// TODO: Issue #906 - Connect to delegation registry (if needed)
+pub fn validate_withdrawal(
+    _env: &Env,
+    trader: Address,
+    _asset: Address,
+    amount: i128,
+    delegate: Option<Address>,
+) -> Result<(), &'static str> {
+    if amount <= 0 {
+        return Err("withdrawal: amount must be positive");
+    }
+
+    match delegate {
+        Some(d) => d.require_auth(),
+        None => trader.require_auth(),
+    }
+
+    Ok(())
+}
+
+/// Check available balance and prevent over-withdrawal
+///
+/// # Arguments
+/// * `available_balance` - Currently available (not locked) balance
+/// * `amount` - Amount requested for withdrawal
+///
+/// # Validation
+/// Ensures withdrawal respects the fully-collateralized-offer principle:
+/// locked tokens in open orders cannot be withdrawn, even if total
+/// (available + locked) would be sufficient.
+///
+/// # Implementation Status
+/// TODO: Issue #906 - Load trader's available balance from storage
+pub fn check_available_balance(
+    available_balance: i128,
+    amount: i128,
+) -> Result<(), &'static str> {
+    if amount > available_balance {
+        return Err("withdrawal: insufficient available balance");
+    }
+    Ok(())
 }
 
 // ─── Read Functions (Stub Implementations) ────────────────────────────────────
