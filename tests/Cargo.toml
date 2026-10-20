@@ -128,3 +128,7 @@ path = "privileged_auth_matrix.rs"
 [[test]]
 name = "fee_receiver_routing"
 path = "fee_receiver_routing.rs"
+
+[[test]]
+name = "shared_quote_token_fees"
+path = "shared_quote_token_fees.rs"

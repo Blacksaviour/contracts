@@ -263,24 +263,26 @@ File: `contracts/fee_handler/src/lib.rs`
 
 | Function | Expected Auth | Status | Notes |
 |---|---|---|---|
-| `initialize` | caller/admin/keeper | ✅ PASS | line 218, before state change |
-| `claimable_fees` | read-only | ➖ N/A | line 237, read-only |
-| `claim_fees` | caller/admin/keeper | ✅ PASS | line 262, before state change |
-| `get_fee_receiver` | read-only | ➖ N/A | line 351, read-only |
-| `get_protocol_fee_receiver` | read-only | ➖ N/A | line 356, read-only |
-| `get_market_fee_receiver` | read-only | ➖ N/A | line 361, read-only |
-| `set_fee_receiver` | caller/admin/keeper | ✅ PASS | line 368, before state change |
-| `set_market_fee_receiver` | caller/admin/keeper | ✅ PASS | line 388, before state change |
-| `set_auto_compound` | caller/admin/keeper | ✅ PASS | line 420, before state change |
-| `is_auto_compound` | read-only | ➖ N/A | line 440, read-only |
-| `record_fee_accrual` | caller/admin/keeper | ✅ PASS | line 451, before state change |
-| `upgrade` | caller/admin/keeper | ✅ PASS | line 481, before state change |
-| `claimable_ui_fees` | read-only | ➖ N/A | line 494, read-only |
-| `accrue_ui_fee` | caller/admin/keeper | ✅ PASS | line 515, before state change |
-| `claim_ui_fees` | caller/admin/keeper | ✅ PASS | line 563, before state change |
-| `claim_funding_fees` | caller/admin/keeper | ✅ PASS | line 606, before state change |
-| `get_ui_fee_factor` | read-only | ➖ N/A | line 649, read-only |
-| `set_ui_fee_factor` | caller/admin/keeper | ✅ PASS | line 662, before state change |
+| `initialize` | caller/admin/keeper | ✅ PASS | line 373, before state change |
+| `claimable_fees` | read-only | ➖ N/A | line 392, read-only |
+| `claim_fees` | caller/admin/keeper | ✅ PASS | line 417, before state change |
+| `claimable_fees_by_token` | read-only | ➖ N/A | line 434, read-only |
+| `claim_token_fees` | caller/admin/keeper | ✅ PASS | line 465, before state change |
+| `get_fee_receiver` | read-only | ➖ N/A | line 498, read-only |
+| `get_protocol_fee_receiver` | read-only | ➖ N/A | line 503, read-only |
+| `get_market_fee_receiver` | read-only | ➖ N/A | line 508, read-only |
+| `set_fee_receiver` | caller/admin/keeper | ✅ PASS | line 515, before state change |
+| `set_market_fee_receiver` | caller/admin/keeper | ✅ PASS | line 535, before state change |
+| `set_auto_compound` | caller/admin/keeper | ✅ PASS | line 567, before state change |
+| `is_auto_compound` | read-only | ➖ N/A | line 587, read-only |
+| `record_fee_accrual` | caller/admin/keeper | ✅ PASS | line 598, before state change |
+| `upgrade` | caller/admin/keeper | ✅ PASS | line 628, before state change |
+| `claimable_ui_fees` | read-only | ➖ N/A | line 641, read-only |
+| `accrue_ui_fee` | caller/admin/keeper | ✅ PASS | line 662, before state change |
+| `claim_ui_fees` | caller/admin/keeper | ✅ PASS | line 710, before state change |
+| `claim_funding_fees` | caller/admin/keeper | ✅ PASS | line 753, before state change |
+| `get_ui_fee_factor` | read-only | ➖ N/A | line 796, read-only |
+| `set_ui_fee_factor` | caller/admin/keeper | ✅ PASS | line 809, before state change |
 
 ---
 
@@ -326,43 +328,43 @@ File: `contracts/reader/src/lib.rs`
 
 | Function | Expected Auth | Status | Notes |
 |---|---|---|---|
-| `initialize` | caller/admin/keeper | ✅ PASS | line 124, before state change |
-| `upgrade` | caller/admin/keeper | ✅ PASS | line 136, before state change |
-| `get_market` | read-only | ➖ N/A | line 149, read-only |
-| `get_market_pool_value_info` | read-only | ➖ N/A | line 169, read-only |
-| `get_market_token_price` | read-only | ➖ N/A | line 196, read-only |
-| `get_open_interest` | read-only | ➖ N/A | line 216, read-only |
-| `get_funding_info` | read-only | ➖ N/A | line 224, read-only |
-| `get_funding_rate_info` | read-only | ➖ N/A | line 258, read-only |
-| `get_protocol_stats` | read-only | ➖ N/A | line 307, read-only |
-| `check_keeper_heartbeat` | read-only | ➖ N/A | line 388, read-only |
-| `get_position_info` | read-only | ➖ N/A | line 419, read-only |
-| `get_claimable_funding_amount` | read-only | ➖ N/A | line 537, read-only |
-| `get_execution_price_preview` | read-only | ➖ N/A | line 616, read-only |
-| `is_position_liquidatable` | read-only | ➖ N/A | line 655, read-only |
-| `get_order` | read-only | ➖ N/A | line 693, read-only |
-| `get_account_orders` | read-only | ➖ N/A | line 698, read-only |
-| `get_pending_orders` | read-only | ➖ N/A | line 726, read-only |
-| `get_position_info_by_key` | read-only | ➖ N/A | line 774, read-only |
-| `get_deposit` | read-only | ➖ N/A | line 875, read-only |
-| `get_withdrawal` | read-only | ➖ N/A | line 884, read-only |
-| `get_deposit_count` | read-only | ➖ N/A | line 895, read-only |
-| `get_deposit_keys` | read-only | ➖ N/A | line 900, read-only |
-| `get_account_deposit_count` | read-only | ➖ N/A | line 914, read-only |
-| `get_account_deposit_keys` | read-only | ➖ N/A | line 920, read-only |
-| `get_withdrawal_count` | read-only | ➖ N/A | line 937, read-only |
-| `get_withdrawal_keys` | read-only | ➖ N/A | line 942, read-only |
-| `get_account_withdrawal_count` | read-only | ➖ N/A | line 956, read-only |
-| `get_account_withdrawal_keys` | read-only | ➖ N/A | line 962, read-only |
-| `get_order_count` | read-only | ➖ N/A | line 979, read-only |
-| `get_order_keys` | read-only | ➖ N/A | line 984, read-only |
-| `get_account_order_count` | read-only | ➖ N/A | line 993, read-only |
-| `get_account_order_keys` | read-only | ➖ N/A | line 999, read-only |
-| `get_account_positions` | read-only | ➖ N/A | line 1014, read-only |
-| `get_position_leverage` | read-only | ➖ N/A | line 1054, read-only |
-| `get_liquidatable_positions` | read-only | ➖ N/A | line 1150, read-only |
-| `get_adl_eligible_positions` | read-only | ➖ N/A | line 1267, read-only |
-| `estimate_swap_output` | read-only | ➖ N/A | line 1383, read-only |
+| `initialize` | caller/admin/keeper | ✅ PASS | line 127, before state change |
+| `upgrade` | caller/admin/keeper | ✅ PASS | line 139, before state change |
+| `get_market` | read-only | ➖ N/A | line 152, read-only |
+| `get_market_pool_value_info` | read-only | ➖ N/A | line 172, read-only |
+| `get_market_token_price` | read-only | ➖ N/A | line 199, read-only |
+| `get_open_interest` | read-only | ➖ N/A | line 219, read-only |
+| `get_funding_info` | read-only | ➖ N/A | line 227, read-only |
+| `get_funding_rate_info` | read-only | ➖ N/A | line 261, read-only |
+| `get_protocol_stats` | read-only | ➖ N/A | line 311, read-only |
+| `check_keeper_heartbeat` | read-only | ➖ N/A | line 400, read-only |
+| `get_position_info` | read-only | ➖ N/A | line 431, read-only |
+| `get_claimable_funding_amount` | read-only | ➖ N/A | line 549, read-only |
+| `get_execution_price_preview` | read-only | ➖ N/A | line 628, read-only |
+| `is_position_liquidatable` | read-only | ➖ N/A | line 667, read-only |
+| `get_order` | read-only | ➖ N/A | line 705, read-only |
+| `get_account_orders` | read-only | ➖ N/A | line 710, read-only |
+| `get_pending_orders` | read-only | ➖ N/A | line 738, read-only |
+| `get_position_info_by_key` | read-only | ➖ N/A | line 786, read-only |
+| `get_deposit` | read-only | ➖ N/A | line 887, read-only |
+| `get_withdrawal` | read-only | ➖ N/A | line 896, read-only |
+| `get_deposit_count` | read-only | ➖ N/A | line 907, read-only |
+| `get_deposit_keys` | read-only | ➖ N/A | line 912, read-only |
+| `get_account_deposit_count` | read-only | ➖ N/A | line 926, read-only |
+| `get_account_deposit_keys` | read-only | ➖ N/A | line 932, read-only |
+| `get_withdrawal_count` | read-only | ➖ N/A | line 949, read-only |
+| `get_withdrawal_keys` | read-only | ➖ N/A | line 954, read-only |
+| `get_account_withdrawal_count` | read-only | ➖ N/A | line 968, read-only |
+| `get_account_withdrawal_keys` | read-only | ➖ N/A | line 974, read-only |
+| `get_order_count` | read-only | ➖ N/A | line 991, read-only |
+| `get_order_keys` | read-only | ➖ N/A | line 996, read-only |
+| `get_account_order_count` | read-only | ➖ N/A | line 1005, read-only |
+| `get_account_order_keys` | read-only | ➖ N/A | line 1011, read-only |
+| `get_account_positions` | read-only | ➖ N/A | line 1026, read-only |
+| `get_position_leverage` | read-only | ➖ N/A | line 1066, read-only |
+| `get_liquidatable_positions` | read-only | ➖ N/A | line 1162, read-only |
+| `get_adl_eligible_positions` | read-only | ➖ N/A | line 1279, read-only |
+| `estimate_swap_output` | read-only | ➖ N/A | line 1395, read-only |
 
 ---
 
@@ -522,7 +524,7 @@ File: `contracts/test_token/src/lib.rs`
 
 | Total public functions audited | Auth-bearing | Read-only (N/A) | PASS | FAIL |
 |---|---|---|---|---|
-| 290 | 166 | 124 | **166** | **0** |
+| 292 | 167 | 125 | **167** | **0** |
 
 All `require_auth` call-sites fire **before** any storage read or write that could be influenced by the caller's identity. No failures were identified. No linked bug issues are raised.
 

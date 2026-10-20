@@ -172,6 +172,27 @@ Reads: `get_fee_receiver(market)` (the recipient that will actually be paid),
   `on_behalf_of`, …) influences where protocol fees accrue or where they are paid.
 - v1 pays each market to a single recipient. Splits are not supported.
 
+**Shared quote tokens (per-market attribution):** several markets may accrue fees in the same
+token (e.g. every `*/USDC` market). The topology is market-scoped for both custody and ledger:
+
+- Custody: each market's fees sit in that market's own `market_token` pool; markets never share a
+  custody balance.
+- Ledger: fees accrue to `claimable_fee_amount(market, token)` and are backed by
+  `pool_amount(market, token)`. Both keys include the market, so two markets sharing a token write
+  different entries and cannot overwrite each other. There is no separate token-level fee ledger,
+  so the same tokens are never recorded twice.
+- Token-level reads and withdrawals aggregate per-market entries rather than replacing them:
+
+| Entrypoint | Auth | Behaviour |
+|---|---|---|
+| `claimable_fees_by_token(token, markets)` | none (view) | `TokenFeeAttribution { token, total, markets: [MarketFeeAmount { market, amount }] }` |
+| `claim_token_fees(keeper, token, markets)` | `FEE_KEEPER` | Claims each market exactly as `claim_fees` does (own pool, own `pool_amount`, own recipient, own `fee_clm` event), then emits `tkfee_clm` `TokenFeesClaimed { token, total, market_count }`. Atomic: one failing market reverts the whole call. |
+
+- Both reject a market listed twice (`DuplicateMarket`, #10), so a market's ledger cannot be counted
+  twice in `total`. Both accept at most `MAX_TOKEN_FEE_MARKETS` (20) markets (`TooManyMarkets`, #9),
+  and `total` uses checked addition (`FeeOverflow`, #11).
+- `reader::get_protocol_stats` rejects duplicate markets for the same reason (`DuplicateMarket`, #6).
+
 **Risk:** NONE — correct CEI ordering; destination is trusted configuration only.
 
 ---

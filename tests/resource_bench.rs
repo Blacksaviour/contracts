@@ -399,19 +399,30 @@ fn run_scenarios() -> BTreeMap<&'static str, Metrics> {
 
     let fees: u128 = ONE_TOKEN as u128;
     let ds_c = DsClient::new(env, &w.ds);
-    ds_c.set_u128(
-        &w.admin,
-        &gmx_keys::claimable_fee_amount_key(env, &w.market_tk, &w.long_tk),
-        &fees,
-    );
-    ds_c.set_u128(
-        &w.admin,
-        &gmx_keys::pool_amount_key(env, &w.market_tk, &w.long_tk),
-        &fees,
-    );
-    StellarAssetClient::new(env, &w.long_tk).mint(&w.market_tk, &(fees as i128));
+    let seed = || {
+        ds_c.set_u128(
+            &w.admin,
+            &gmx_keys::claimable_fee_amount_key(env, &w.market_tk, &w.long_tk),
+            &fees,
+        );
+        ds_c.set_u128(
+            &w.admin,
+            &gmx_keys::pool_amount_key(env, &w.market_tk, &w.long_tk),
+            &fees,
+        );
+        StellarAssetClient::new(env, &w.long_tk).mint(&w.market_tk, &(fees as i128));
+    };
+    seed();
     fh.claim_fees(&fee_keeper, &w.market_tk, &w.long_tk);
     out.insert("fees/claim_fees", Metrics::of_last_invocation(env));
+
+    seed();
+    fh.claim_token_fees(
+        &fee_keeper,
+        &w.long_tk,
+        &soroban_sdk::Vec::from_array(env, [w.market_tk.clone()]),
+    );
+    out.insert("fees/claim_token_fees", Metrics::of_last_invocation(env));
 
     out
 }

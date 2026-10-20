@@ -11,8 +11,12 @@ use gmx_keys::{
 use gmx_math::FLOAT_PRECISION;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
-    BytesN, Env,
+    BytesN, Env, Vec,
 };
+
+/// Upper bound on markets per `claimable_fees_by_token` / `claim_token_fees`
+/// call, so a token-level view or sweep never iterates without bound.
+pub const MAX_TOKEN_FEE_MARKETS: u32 = 20;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -55,6 +59,33 @@ pub enum Error {
     /// The recipient would be the market pool itself or this handler — paying
     /// fees there would decrement `pool_amount` without tokens leaving the pool.
     InvalidFeeReceiver = 8,
+    /// A token-level fee call listed more than `MAX_TOKEN_FEE_MARKETS` markets.
+    TooManyMarkets = 9,
+    /// A token-level fee call listed the same market twice, which would count
+    /// that market's ledger twice in the aggregate.
+    DuplicateMarket = 10,
+    /// Summing per-market fee ledgers overflowed `u128`.
+    FeeOverflow = 11,
+}
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+/// One market's share of a token-level fee total.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketFeeAmount {
+    pub market: Address,
+    pub amount: u128,
+}
+
+/// Protocol fees in one token across a set of markets, with per-market
+/// attribution. `total` is the checked sum of `markets[i].amount`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenFeeAttribution {
+    pub token: Address,
+    pub total: u128,
+    pub markets: Vec<MarketFeeAmount>,
 }
 
 // ─── External clients ─────────────────────────────────────────────────────────
@@ -150,6 +181,16 @@ pub struct FeeReceiverSet {
     pub receiver: Option<Address>,
 }
 
+/// Emitted once per `claim_token_fees` call, after the per-market `FeeClaimed`
+/// events that carry the attribution.
+#[contractevent(topics = ["tkfee_clm"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenFeesClaimed {
+    pub token: Address,
+    pub total: u128,
+    pub market_count: u32,
+}
+
 #[contractevent(topics = ["fee_acc"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeAccrued {
@@ -210,6 +251,120 @@ fn resolve_fee_receiver(env: &Env, market: &Address) -> Option<Address> {
     market_fee_receiver(env, market).or_else(|| protocol_fee_receiver(env))
 }
 
+fn data_store(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&InstanceKey::DataStore)
+        .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized))
+}
+
+/// Callers authenticate `keeper` themselves before this role check.
+fn require_fee_keeper_role(env: &Env, keeper: &Address) {
+    let role_store: Address = env
+        .storage()
+        .instance()
+        .get(&InstanceKey::RoleStore)
+        .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+    if !RoleStoreClient::new(env, &role_store).has_role(keeper, &roles::fee_keeper(env)) {
+        panic_with_error!(env, Error::Unauthorized);
+    }
+}
+
+/// Reject a market list that is too long or names a market twice. Pairwise
+/// comparison is bounded by `MAX_TOKEN_FEE_MARKETS`.
+fn require_distinct_markets(env: &Env, markets: &Vec<Address>) {
+    let n = markets.len();
+    if n > MAX_TOKEN_FEE_MARKETS {
+        panic_with_error!(env, Error::TooManyMarkets);
+    }
+    for i in 0..n {
+        let market = markets.get_unchecked(i);
+        for j in (i + 1)..n {
+            if markets.get_unchecked(j) == market {
+                panic_with_error!(env, Error::DuplicateMarket);
+            }
+        }
+    }
+}
+
+/// Sweep one `(market, token)` fee ledger from that market's own pool to the
+/// market's trusted recipient and return the amount transferred. Fees are
+/// attributed and custodied per market, so this never reads or writes another
+/// market's ledger, `pool_amount` or token balance.
+fn claim_market_fees(env: &Env, ds: &DataStoreClient, market: &Address, token: &Address) -> u128 {
+    let receiver = resolve_fee_receiver(env, market)
+        .unwrap_or_else(|| panic_with_error!(env, Error::FeeReceiverNotSet));
+    // The protocol recipient is validated against this handler when set, but
+    // it cannot be checked against every market up front.
+    if receiver == *market {
+        panic_with_error!(env, Error::InvalidFeeReceiver);
+    }
+
+    let handler = env.current_contract_address();
+
+    // Issue #285: if auto-compound is enabled, fees stay in the pool permanently.
+    // The claimable tracker may still hold a non-zero value from before the flag
+    // was set; return 0 so no tokens leave the pool.
+    if ds.get_bool(&auto_compound_fees_key(env, market)) {
+        return 0;
+    }
+
+    let key = claimable_fee_amount_key(env, market, token);
+    let amount = ds.get_u128(&key);
+    if amount == 0 {
+        return 0;
+    }
+
+    // Issue #254: assert the pool's tracked accounting actually backs the
+    // claimable amount before any transfer executes. Fee accrual always adds
+    // to `pool_amount` in lockstep with `claimable_fee_amount` (see
+    // decrease_position_utils/swap_utils/increase_position_utils), so in
+    // normal operation this can never fail; it exists to reject a claim
+    // outright if a rounding-accumulation bug ever lets claimable outrun it,
+    // instead of silently overdrafting the pool's accounting.
+    let pool_key = pool_amount_key(env, market, token);
+    let pool_amt = ds.get_u128(&pool_key);
+    if amount > pool_amt {
+        panic_with_error!(env, Error::InsufficientPoolBalance);
+    }
+
+    // Balance-before-transfer guard: cap the withdrawal at the pool's actual
+    // token balance too, in case the real SEP-41 balance ever falls short of
+    // the (now-validated) pool accounting.
+    let transfer_amount = safe_transfer_amount(env, token, market, amount);
+    // Store the portion we could not yet claim (normally zero).
+    ds.set_u128(&handler, &key, &amount.saturating_sub(transfer_amount));
+    if transfer_amount == 0 {
+        return 0;
+    }
+
+    // Transfer from market_token pool to receiver
+    MarketTokenClient::new(env, market).withdraw_from_pool(
+        &handler,
+        token,
+        &receiver,
+        &(transfer_amount as i128),
+    );
+
+    // Pool amount is decremented by exactly the claimed amount (issue #254):
+    // these tokens have left the pool, so its accounting must reflect that.
+    ds.apply_delta_to_u128(&handler, &pool_key, &-(transfer_amount as i128));
+
+    env.events().publish_event(&FeeClaimed {
+        market: market.clone(),
+        token: token.clone(),
+        amount: transfer_amount,
+        receiver,
+    });
+    transfer_amount
+}
+
+fn checked_fee_add(env: &Env, total: u128, amount: u128) -> u128 {
+    total
+        .checked_add(amount)
+        .unwrap_or_else(|| panic_with_error!(env, Error::FeeOverflow))
+}
+
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -262,87 +417,79 @@ impl FeeHandler {
     /// as claimable. `pool_amount` is decremented by exactly what is transferred.
     pub fn claim_fees(env: Env, keeper: Address, market: Address, token: Address) -> u128 {
         keeper.require_auth();
+        require_fee_keeper_role(&env, &keeper);
+        let ds = DataStoreClient::new(&env, &data_store(&env));
+        claim_market_fees(&env, &ds, &market, &token)
+    }
 
-        let role_store: Address = env
-            .storage()
-            .instance()
-            .get(&InstanceKey::RoleStore)
-            .unwrap();
-        if !RoleStoreClient::new(&env, &role_store).has_role(&keeper, &roles::fee_keeper(&env)) {
-            panic_with_error!(&env, Error::Unauthorized);
+    // ── Per-market attribution for shared tokens ─────────────────────────────
+
+    /// Return the protocol fees owed in `token` across `markets`, attributed per
+    /// market. View only.
+    ///
+    /// Each market keeps its own `claimable_fee_amount(market, token)` ledger and
+    /// holds its own custody, so two markets sharing a quote token never share
+    /// or overwrite a ledger entry. `total` is the checked sum of the listed
+    /// markets; listing a market twice is rejected with `DuplicateMarket` so it
+    /// cannot be counted twice. At most `MAX_TOKEN_FEE_MARKETS` markets.
+    pub fn claimable_fees_by_token(
+        env: Env,
+        token: Address,
+        markets: Vec<Address>,
+    ) -> TokenFeeAttribution {
+        require_distinct_markets(&env, &markets);
+        let ds = DataStoreClient::new(&env, &data_store(&env));
+        let mut total = 0u128;
+        let mut entries = Vec::new(&env);
+        for market in markets.iter() {
+            let amount = ds.get_u128(&claimable_fee_amount_key(&env, &market, &token));
+            total = checked_fee_add(&env, total, amount);
+            entries.push_back(MarketFeeAmount { market, amount });
         }
-
-        let receiver = resolve_fee_receiver(&env, &market)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::FeeReceiverNotSet));
-        // The protocol recipient is validated against this handler when set, but
-        // it cannot be checked against every market up front.
-        if receiver == market {
-            panic_with_error!(&env, Error::InvalidFeeReceiver);
-        }
-
-        let data_store: Address = env
-            .storage()
-            .instance()
-            .get(&InstanceKey::DataStore)
-            .unwrap();
-        let ds = DataStoreClient::new(&env, &data_store);
-        let handler = env.current_contract_address();
-
-        // Issue #285: if auto-compound is enabled, fees stay in the pool permanently.
-        // The claimable tracker may still hold a non-zero value from before the flag
-        // was set; return 0 so no tokens leave the pool.
-        if ds.get_bool(&auto_compound_fees_key(&env, &market)) {
-            return 0;
-        }
-
-        let key = claimable_fee_amount_key(&env, &market, &token);
-        let amount = ds.get_u128(&key);
-        if amount == 0 {
-            return 0;
-        }
-
-        // Issue #254: assert the pool's tracked accounting actually backs the
-        // claimable amount before any transfer executes. Fee accrual always adds
-        // to `pool_amount` in lockstep with `claimable_fee_amount` (see
-        // decrease_position_utils/swap_utils/increase_position_utils), so in
-        // normal operation this can never fail; it exists to reject a claim
-        // outright if a rounding-accumulation bug ever lets claimable outrun it,
-        // instead of silently overdrafting the pool's accounting.
-        let pool_key = pool_amount_key(&env, &market, &token);
-        let pool_amt = ds.get_u128(&pool_key);
-        if amount > pool_amt {
-            panic_with_error!(&env, Error::InsufficientPoolBalance);
-        }
-
-        // Balance-before-transfer guard: cap the withdrawal at the pool's actual
-        // token balance too, in case the real SEP-41 balance ever falls short of
-        // the (now-validated) pool accounting.
-        let transfer_amount = safe_transfer_amount(&env, &token, &market, amount);
-        // Store the portion we could not yet claim (normally zero).
-        ds.set_u128(&handler, &key, &amount.saturating_sub(transfer_amount));
-        if transfer_amount == 0 {
-            return 0;
-        }
-
-        // Transfer from market_token pool to receiver
-        MarketTokenClient::new(&env, &market).withdraw_from_pool(
-            &handler,
-            &token,
-            &receiver,
-            &(transfer_amount as i128),
-        );
-
-        // Pool amount is decremented by exactly the claimed amount (issue #254):
-        // these tokens have left the pool, so its accounting must reflect that.
-        ds.apply_delta_to_u128(&handler, &pool_key, &-(transfer_amount as i128));
-
-        env.events().publish_event(&FeeClaimed {
-            market,
+        TokenFeeAttribution {
             token,
-            amount: transfer_amount,
-            receiver,
+            total,
+            markets: entries,
+        }
+    }
+
+    /// Sweep `token` fees from every listed market in one call and return the
+    /// per-market attribution of what was transferred. FEE_KEEPER only.
+    ///
+    /// The withdrawal aggregates by token but the accounting does not: each
+    /// market is claimed exactly as `claim_fees` would claim it — from its own
+    /// pool, against its own ledger and `pool_amount`, to its own trusted
+    /// recipient — and emits its own `FeeClaimed`. A `TokenFeesClaimed` event
+    /// then records the total. The call is atomic: any market failing (no
+    /// recipient, `InsufficientPoolBalance`, ...) reverts every transfer.
+    /// Duplicate markets are rejected; at most `MAX_TOKEN_FEE_MARKETS`.
+    pub fn claim_token_fees(
+        env: Env,
+        keeper: Address,
+        token: Address,
+        markets: Vec<Address>,
+    ) -> TokenFeeAttribution {
+        keeper.require_auth();
+        require_fee_keeper_role(&env, &keeper);
+        require_distinct_markets(&env, &markets);
+        let ds = DataStoreClient::new(&env, &data_store(&env));
+        let mut total = 0u128;
+        let mut entries = Vec::new(&env);
+        for market in markets.iter() {
+            let amount = claim_market_fees(&env, &ds, &market, &token);
+            total = checked_fee_add(&env, total, amount);
+            entries.push_back(MarketFeeAmount { market, amount });
+        }
+        env.events().publish_event(&TokenFeesClaimed {
+            token: token.clone(),
+            total,
+            market_count: markets.len(),
         });
-        transfer_amount
+        TokenFeeAttribution {
+            token,
+            total,
+            markets: entries,
+        }
     }
 
     // ── Constrained fee recipients ───────────────────────────────────────────
@@ -694,7 +841,7 @@ mod tests {
     use gmx_keys::roles;
     use market_token::{MarketToken, MarketTokenClient as MtClient};
     use role_store::{RoleStore, RoleStoreClient as RsClient};
-    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, BytesN, Env};
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, BytesN, Env, Vec};
 
     const ONE_TOKEN: i128 = 10_000_000;
 
@@ -1283,6 +1430,271 @@ mod tests {
 
         fh.set_market_fee_receiver(&w.market_tk, &None);
         expect(Some(w.market_tk.clone()), Some(partner), None);
+    }
+
+    // ── Per-market attribution for shared tokens ─────────────────────────────
+
+    /// A second market whose pool holds the same token as `w.market_tk`.
+    fn second_market(w: &World) -> Address {
+        let market = w.env.register(MarketToken, ());
+        MtClient::new(&w.env, &market).initialize(
+            &w.admin,
+            &w.rs,
+            &7u32,
+            &soroban_sdk::String::from_str(&w.env, "FH Test Market 2"),
+            &soroban_sdk::String::from_str(&w.env, "FM2"),
+            &w.long_tk,
+            &w.long_tk,
+        );
+        RsClient::new(&w.env, &w.rs).grant_role(&w.admin, &market, &roles::controller(&w.env));
+        market
+    }
+
+    /// `(claimable_fee_amount, pool_amount)` for `market`'s token.
+    fn ledger(w: &World, market: &Address) -> (u128, u128) {
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        (
+            ds_c.get_u128(&gmx_keys::claimable_fee_amount_key(
+                &w.env, market, &w.long_tk,
+            )),
+            ds_c.get_u128(&gmx_keys::pool_amount_key(&w.env, market, &w.long_tk)),
+        )
+    }
+
+    fn markets(w: &World, list: &[&Address]) -> Vec<Address> {
+        let mut v = Vec::new(&w.env);
+        for m in list {
+            v.push_back((*m).clone());
+        }
+        v
+    }
+
+    fn attribution(w: &World, list: &[(&Address, u128)]) -> Vec<MarketFeeAmount> {
+        let mut v = Vec::new(&w.env);
+        for (market, amount) in list {
+            v.push_back(MarketFeeAmount {
+                market: (*market).clone(),
+                amount: *amount,
+            });
+        }
+        v
+    }
+
+    /// Two markets accruing the same token keep independent ledgers: neither
+    /// write overwrites the other, and the token view attributes each share.
+    #[test]
+    fn markets_sharing_a_token_keep_separate_fee_ledgers() {
+        let w = setup();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        let market_b = second_market(&w);
+
+        seed_fees(&w, &w.market_tk, 700);
+        seed_fees(&w, &market_b, 300);
+
+        assert_eq!(fh.claimable_fees(&w.market_tk, &w.long_tk), 700);
+        assert_eq!(fh.claimable_fees(&market_b, &w.long_tk), 300);
+
+        let view = fh.claimable_fees_by_token(&w.long_tk, &markets(&w, &[&w.market_tk, &market_b]));
+        assert_eq!(view.token, w.long_tk);
+        assert_eq!(view.total, 1_000);
+        assert_eq!(
+            view.markets,
+            attribution(&w, &[(&w.market_tk, 700), (&market_b, 300)])
+        );
+
+        // Claiming one market touches only that market's ledger, pool
+        // accounting and custody.
+        assert_eq!(fh.claim_fees(&w.keeper, &w.market_tk, &w.long_tk), 700);
+        assert_eq!(ledger(&w, &w.market_tk), (0, 0));
+        assert_eq!(ledger(&w, &market_b), (300, 300));
+        assert_eq!(balance(&w, &market_b), 300);
+        assert_eq!(balance(&w, &w.treasury), 700);
+    }
+
+    /// The token-level sweep aggregates the withdrawal but pays each market
+    /// from its own pool to its own recipient, with per-market events.
+    #[test]
+    fn claim_token_fees_attributes_each_market_and_pays_its_recipient() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::Event as _;
+
+        let w = setup();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        let market_b = second_market(&w);
+        let partner = Address::generate(&w.env);
+        fh.set_market_fee_receiver(&market_b, &Some(partner.clone()));
+
+        seed_fees(&w, &w.market_tk, 700);
+        seed_fees(&w, &market_b, 300);
+
+        let result = fh.claim_token_fees(
+            &w.keeper,
+            &w.long_tk,
+            &markets(&w, &[&w.market_tk, &market_b]),
+        );
+        assert_eq!(
+            w.env.events().all().filter_by_contract(&w.handler),
+            [
+                FeeClaimed {
+                    market: w.market_tk.clone(),
+                    token: w.long_tk.clone(),
+                    amount: 700,
+                    receiver: w.treasury.clone(),
+                }
+                .to_xdr(&w.env, &w.handler),
+                FeeClaimed {
+                    market: market_b.clone(),
+                    token: w.long_tk.clone(),
+                    amount: 300,
+                    receiver: partner.clone(),
+                }
+                .to_xdr(&w.env, &w.handler),
+                TokenFeesClaimed {
+                    token: w.long_tk.clone(),
+                    total: 1_000,
+                    market_count: 2,
+                }
+                .to_xdr(&w.env, &w.handler),
+            ]
+        );
+
+        assert_eq!(result.total, 1_000);
+        assert_eq!(
+            result.markets,
+            attribution(&w, &[(&w.market_tk, 700), (&market_b, 300)])
+        );
+        assert_eq!(balance(&w, &w.treasury), 700);
+        assert_eq!(balance(&w, &partner), 300);
+        assert_eq!(balance(&w, &w.keeper), 0);
+        assert_eq!(ledger(&w, &w.market_tk), (0, 0));
+        assert_eq!(ledger(&w, &market_b), (0, 0));
+    }
+
+    /// Listing a market twice would count its ledger twice; both token-level
+    /// calls reject it and nothing moves.
+    #[test]
+    fn token_fee_calls_reject_duplicate_markets() {
+        let w = setup();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        let market_b = second_market(&w);
+        seed_fees(&w, &w.market_tk, 500);
+        let dup = markets(&w, &[&w.market_tk, &market_b, &w.market_tk]);
+
+        assert_err(
+            fh.try_claimable_fees_by_token(&w.long_tk, &dup)
+                .unwrap_err()
+                .unwrap(),
+            Error::DuplicateMarket,
+        );
+        assert_err(
+            fh.try_claim_token_fees(&w.keeper, &w.long_tk, &dup)
+                .unwrap_err()
+                .unwrap(),
+            Error::DuplicateMarket,
+        );
+        assert_eq!(ledger(&w, &w.market_tk), (500, 500));
+        assert_eq!(balance(&w, &w.treasury), 0);
+    }
+
+    #[test]
+    fn token_fee_calls_are_bounded() {
+        let w = setup();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        let mut list = Vec::new(&w.env);
+        for _ in 0..=MAX_TOKEN_FEE_MARKETS {
+            list.push_back(Address::generate(&w.env));
+        }
+
+        assert_err(
+            fh.try_claimable_fees_by_token(&w.long_tk, &list)
+                .unwrap_err()
+                .unwrap(),
+            Error::TooManyMarkets,
+        );
+        assert_err(
+            fh.try_claim_token_fees(&w.keeper, &w.long_tk, &list)
+                .unwrap_err()
+                .unwrap(),
+            Error::TooManyMarkets,
+        );
+
+        // Exactly the limit, and an empty list, are accepted.
+        list.pop_back();
+        assert_eq!(fh.claimable_fees_by_token(&w.long_tk, &list).total, 0);
+        assert_eq!(
+            fh.claimable_fees_by_token(&w.long_tk, &Vec::new(&w.env))
+                .total,
+            0
+        );
+    }
+
+    #[test]
+    fn claim_token_fees_requires_fee_keeper() {
+        let w = setup();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        let outsider = Address::generate(&w.env);
+        seed_fees(&w, &w.market_tk, 500);
+
+        assert_err(
+            fh.try_claim_token_fees(&outsider, &w.long_tk, &markets(&w, &[&w.market_tk]))
+                .unwrap_err()
+                .unwrap(),
+            Error::Unauthorized,
+        );
+        assert_eq!(ledger(&w, &w.market_tk), (500, 500));
+        assert_eq!(balance(&w, &outsider), 0);
+    }
+
+    /// One market whose ledger is not backed by its own pool accounting fails
+    /// the whole sweep — another market's pool can never cover it.
+    #[test]
+    fn claim_token_fees_reverts_atomically_when_one_market_is_unbacked() {
+        let w = setup();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        let market_b = second_market(&w);
+        seed_fees(&w, &w.market_tk, 700);
+        DsClient::new(&w.env, &w.ds).set_u128(
+            &w.admin,
+            &gmx_keys::claimable_fee_amount_key(&w.env, &market_b, &w.long_tk),
+            &300,
+        );
+
+        assert_err(
+            fh.try_claim_token_fees(
+                &w.keeper,
+                &w.long_tk,
+                &markets(&w, &[&w.market_tk, &market_b]),
+            )
+            .unwrap_err()
+            .unwrap(),
+            Error::InsufficientPoolBalance,
+        );
+        assert_eq!(ledger(&w, &w.market_tk), (700, 700));
+        assert_eq!(ledger(&w, &market_b), (300, 0));
+        assert_eq!(balance(&w, &w.market_tk), 700);
+        assert_eq!(balance(&w, &w.treasury), 0);
+    }
+
+    #[test]
+    fn claimable_fees_by_token_rejects_overflowing_total() {
+        let w = setup();
+        let fh = FeeHandlerClient::new(&w.env, &w.handler);
+        let market_b = second_market(&w);
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        for (market, amount) in [(&w.market_tk, u128::MAX), (&market_b, 1)] {
+            ds_c.set_u128(
+                &w.admin,
+                &gmx_keys::claimable_fee_amount_key(&w.env, market, &w.long_tk),
+                &amount,
+            );
+        }
+
+        assert_err(
+            fh.try_claimable_fees_by_token(&w.long_tk, &markets(&w, &[&w.market_tk, &market_b]))
+                .unwrap_err()
+                .unwrap(),
+            Error::FeeOverflow,
+        );
     }
 
     // ── Issue #110: upgrade smoke tests ───────────────────────────────────────
