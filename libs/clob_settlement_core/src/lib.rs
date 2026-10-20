@@ -254,40 +254,83 @@ impl FeeAccumulator {
     }
 }
 
-// ============ #959: Quote Rounding ============
-#[derive(Clone, Copy)]
-pub enum RoundingMode { Down, Up, Nearest }
+// ============ #959, #960: Quote Rounding ============
+/// Denominator for scaled prices (protocol spec section 4.1).
+pub const PRICE_SCALE: i128 = 100_000_000;
 
-pub struct QuoteCalculator {
-    pub price: i128,
-    pub base_amount: i128,
+/// Only `Down` and `Up` exist: the spec names no other rounding mode (section 4.2).
+#[derive(Clone, Copy)]
+pub enum RoundingMode { Down, Up }
+
+/// Quote for `base_atoms` at `scaled_price`, rounded as section 4.2 requires.
+/// Contract and SDK previews must call this function, not re-derive the math.
+pub fn quote_atoms(
+    base_atoms: i128,
+    scaled_price: i128,
+    rounding: RoundingMode,
+) -> Result<i128, &'static str> {
+    if base_atoms < 0 || scaled_price < 0 {
+        return Err("quote: negative input");
+    }
+    let numerator = base_atoms.checked_mul(scaled_price).ok_or("quote overflow")?;
+    let quotient = numerator / PRICE_SCALE;
+    match rounding {
+        RoundingMode::Down => Ok(quotient),
+        RoundingMode::Up if numerator % PRICE_SCALE == 0 => Ok(quotient),
+        RoundingMode::Up => Ok(quotient + 1),
+    }
 }
 
-impl QuoteCalculator {
-    pub fn calculate_quote(&self, rounding: RoundingMode) -> Result<i128, &'static str> {
-        let numerator = self.base_amount.checked_mul(self.price).ok_or("quote overflow")?;
-        let denominator = 100_000_000i128;
-        
-        match rounding {
-            RoundingMode::Down => Ok(numerator / denominator),
-            RoundingMode::Up => {
-                let adj = numerator.checked_add(denominator - 1).ok_or("overflow")?;
-                Ok(adj / denominator)
-            }
-            RoundingMode::Nearest => {
-                let adj = numerator.checked_add(denominator / 2).ok_or("overflow")?;
-                Ok(adj / denominator)
-            }
-        }
+/// The quote legs of one fill (protocol spec section 7.2).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FillQuoteLegs {
+    /// Removed from the buyer's locked quote.
+    pub debit: i128,
+    /// Added to the seller's available quote.
+    pub credit: i128,
+    /// Credited to the protocol dust account.
+    pub residue: i128,
+}
+
+/// Quote legs for filling `fill_lots` of a bid with `remaining_before_lots` left.
+/// The debit is a difference of locks, so the buyer's total over any split of
+/// the same bid equals the total over one fill (spec section 10.4, Example C).
+pub fn fill_quote_legs(
+    lot_size: i128,
+    remaining_before_lots: i128,
+    fill_lots: i128,
+    scaled_price: i128,
+) -> Result<FillQuoteLegs, &'static str> {
+    if lot_size <= 0 {
+        return Err("fill: lot size must be positive");
     }
-    
-    pub fn calculate_dust(&self, rounding: RoundingMode) -> Result<i128, &'static str> {
-        let numerator = self.base_amount.checked_mul(self.price).ok_or("overflow")?;
-        let denominator = 100_000_000i128;
-        let quote = self.calculate_quote(rounding)?;
-        let reconstructed = quote.checked_mul(denominator).ok_or("overflow")?;
-        numerator.checked_sub(reconstructed).ok_or("dust negative")
+    if fill_lots <= 0 || fill_lots > remaining_before_lots {
+        return Err("fill: size out of range");
     }
+    let remaining_after_lots = remaining_before_lots - fill_lots;
+    let lock_before = quote_atoms(
+        remaining_before_lots.checked_mul(lot_size).ok_or("fill: atoms overflow")?,
+        scaled_price,
+        RoundingMode::Up,
+    )?;
+    let lock_after = quote_atoms(
+        remaining_after_lots.checked_mul(lot_size).ok_or("fill: atoms overflow")?,
+        scaled_price,
+        RoundingMode::Up,
+    )?;
+    let credit = quote_atoms(
+        fill_lots.checked_mul(lot_size).ok_or("fill: atoms overflow")?,
+        scaled_price,
+        RoundingMode::Down,
+    )?;
+    let debit = lock_before - lock_after;
+    let residue = debit - credit;
+    // Two rounded-up values differ by at most one atom from their rounded-down
+    // sum, so a single fill can only leave a residue of 0 or 1.
+    if !(0..=1).contains(&residue) {
+        return Err("fill: residue out of bounds");
+    }
+    Ok(FillQuoteLegs { debit, credit, residue })
 }
 
 // ============ #981: Order Lifecycle ============
@@ -464,5 +507,68 @@ mod fee_tests {
         assert_eq!(config.resolve_tier(None).unwrap().taker_fee_rate, 100);
         let tier = FeeTier { id: 7, taker_fee_rate: 200 };
         assert_eq!(config.resolve_tier(Some(tier)).unwrap().taker_fee_rate, 200);
+    }
+}
+
+#[cfg(test)]
+mod rounding_tests {
+    use super::*;
+
+    // Spec section 10.4 Examples B and C: lot_size 1, tick 3 with
+    // tick_size 150_000_000, so the scaled price is 4.5 quote atoms per base atom.
+    const TICK_3: i128 = 450_000_000;
+
+    #[test]
+    fn quote_atoms_rounds_in_the_requested_direction() {
+        assert_eq!(quote_atoms(3, TICK_3, RoundingMode::Up).unwrap(), 14);
+        assert_eq!(quote_atoms(3, TICK_3, RoundingMode::Down).unwrap(), 13);
+        assert_eq!(quote_atoms(2, TICK_3, RoundingMode::Up).unwrap(), 9);
+        assert_eq!(quote_atoms(2, TICK_3, RoundingMode::Down).unwrap(), 9);
+    }
+
+    #[test]
+    fn quote_atoms_rejects_negative_and_overflowing_inputs() {
+        assert!(quote_atoms(-1, TICK_3, RoundingMode::Up).is_err());
+        assert!(quote_atoms(i128::MAX, TICK_3, RoundingMode::Down).is_err());
+    }
+
+    #[test]
+    fn single_fill_residue_is_credited_to_dust() {
+        // Example B: the buyer is debited 14, the seller credited 13, dust gains 1.
+        let legs = fill_quote_legs(1, 3, 3, TICK_3).unwrap();
+        assert_eq!(legs, FillQuoteLegs { debit: 14, credit: 13, residue: 1 });
+    }
+
+    #[test]
+    fn split_fills_pay_the_same_as_one_fill() {
+        // Example C: fills of 1 lot and 2 lots total the same as one 3-lot fill.
+        let whole = fill_quote_legs(1, 3, 3, TICK_3).unwrap();
+        let first = fill_quote_legs(1, 3, 1, TICK_3).unwrap();
+        let second = fill_quote_legs(1, 2, 2, TICK_3).unwrap();
+        assert_eq!(first.debit + second.debit, whole.debit);
+        assert_eq!(first.credit + second.credit, whole.credit);
+        assert_eq!(first.residue + second.residue, whole.residue);
+    }
+
+    #[test]
+    fn fragmentation_never_increases_seller_credit() {
+        // Seller credit is a floor of each part, so the parts sum to at most the
+        // floor of the whole. Splitting can only move value to the dust account.
+        let whole_credit = quote_atoms(5, TICK_3, RoundingMode::Down).unwrap();
+        let mut parts_credit = 0;
+        // Five 1-lot fills of a 5-lot bid, with the remaining size walking 5 -> 1.
+        for remaining in (1..=5).rev() {
+            parts_credit += fill_quote_legs(1, remaining, 1, TICK_3).unwrap().credit;
+        }
+        assert_eq!(whole_credit, 22);
+        assert_eq!(parts_credit, 20);
+        assert!(parts_credit <= whole_credit);
+    }
+
+    #[test]
+    fn fill_size_and_lot_size_are_validated() {
+        assert!(fill_quote_legs(1, 3, 0, TICK_3).is_err());
+        assert!(fill_quote_legs(1, 3, 4, TICK_3).is_err());
+        assert!(fill_quote_legs(0, 3, 1, TICK_3).is_err());
     }
 }
