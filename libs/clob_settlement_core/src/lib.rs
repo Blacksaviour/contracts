@@ -154,11 +154,118 @@ impl OrderRequest {
             }
         }
     }
-    
+
     pub fn is_active(&self, current_ledger: u64) -> bool {
         match self.tif {
             TimeInForce::GTC => true,
             TimeInForce::GTD => current_ledger < self.expiry_ledger,
         }
+    }
+}
+
+// ============ #903-906: Custody, Deposits, and Withdrawals ============
+
+#[derive(Clone)]
+pub struct TraderAccount {
+    pub trader: Address,
+    pub asset: Address,
+    pub total_balance: i128,
+    pub available_balance: i128,
+    pub locked_balance: i128,
+}
+
+impl TraderAccount {
+    pub fn new(trader: Address, asset: Address) -> Self {
+        Self {
+            trader,
+            asset,
+            total_balance: 0,
+            available_balance: 0,
+            locked_balance: 0,
+        }
+    }
+
+    pub fn validate_invariants(&self) -> Result<(), &'static str> {
+        let computed_total = self.available_balance.checked_add(self.locked_balance)
+            .ok_or("balance overflow")?;
+        if computed_total != self.total_balance {
+            return Err("balance invariant violated");
+        }
+        if self.available_balance < 0 || self.locked_balance < 0 || self.total_balance < 0 {
+            return Err("negative balance");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct DepositRequest {
+    pub trader: Address,
+    pub asset: Address,
+    pub amount: i128,
+}
+
+impl DepositRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.amount <= 0 {
+            return Err("deposit: amount must be positive");
+        }
+        Ok(())
+    }
+
+    pub fn process_deposit(
+        &self,
+        account: &mut TraderAccount,
+    ) -> Result<(), &'static str> {
+        self.validate()?;
+
+        let new_total = self.amount.checked_add(account.total_balance)
+            .ok_or("deposit: total overflow")?;
+        let new_available = self.amount.checked_add(account.available_balance)
+            .ok_or("deposit: available overflow")?;
+
+        account.total_balance = new_total;
+        account.available_balance = new_available;
+
+        account.validate_invariants()?;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct WithdrawalRequest {
+    pub trader: Address,
+    pub asset: Address,
+    pub amount: i128,
+}
+
+impl WithdrawalRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.amount <= 0 {
+            return Err("withdrawal: amount must be positive");
+        }
+        Ok(())
+    }
+
+    pub fn process_withdrawal(
+        &self,
+        account: &mut TraderAccount,
+    ) -> Result<(), &'static str> {
+        self.validate()?;
+
+        if self.amount > account.available_balance {
+            return Err("withdrawal: insufficient available balance");
+        }
+
+        let new_available = account.available_balance.checked_sub(self.amount)
+            .ok_or("withdrawal: available underflow")?;
+        let new_total = account.total_balance.checked_sub(self.amount)
+            .ok_or("withdrawal: total underflow")?;
+
+        account.available_balance = new_available;
+        account.total_balance = new_total;
+
+        account.validate_invariants()?;
+        Ok(())
     }
 }
