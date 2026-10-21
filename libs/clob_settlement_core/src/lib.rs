@@ -4,6 +4,9 @@
 #![no_std]
 use soroban_sdk::{Address, Env, i128};
 
+// #900: market configuration validation for creation and updates.
+pub mod market_config;
+
 /// Fixed-point denominator used for protocol fee rates.
 /// A rate of 100_000 (0.1%) is represented as 100_000 / FEE_RATE_SCALE.
 pub const FEE_RATE_SCALE: i128 = 100_000_000;
