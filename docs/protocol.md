@@ -30,8 +30,9 @@ behavior in v1 may depend on them.
 - Stop, post-only, immediate-or-cancel, and fill-or-kill orders. v1 time-in-force is limited to
   GTC and GTD (section 5.3).
 - In-place order amendment. A trader changes an order by cancelling it and placing a new one.
-- Trading fees. Fees are not defined by this document. Any fee MUST be applied as a separate
-  transfer that preserves asset conservation (section 9.1).
+- Maker rebates (negative maker fees) and historical-volume fee tiers. v1 maker and taker fees
+  are defined in `docs/fee-accounting.md`. Each fee MUST be applied as part of its fill, in a way
+  that preserves asset conservation (invariant I1).
 
 ## 3. Markets and parameters
 
