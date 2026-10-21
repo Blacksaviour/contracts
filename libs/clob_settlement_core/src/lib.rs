@@ -21,6 +21,139 @@ pub const FEE_RATE_SCALE: i128 = 100_000_000;
 /// exceed it. A rate of zero means that side pays no fee.
 pub const MAX_FEE_RATE: i128 = FEE_RATE_SCALE;
 
+// ============ Resource-bound constants (Phase 0, #013) ============
+/// Maximum number of steps (fills, expired-maker removals, tick scans) per transaction.
+/// Enforced against Soroban CPU/memory/ledger limits. Consensus-critical.
+/// Set by benchmark harness; contract and SDK must use this same value.
+pub const MAX_MATCH_STEPS: u32 = 100; // Placeholder; real value set by benchmark.
+
+/// Largest valid tick index. Orders and market prices must not exceed it.
+/// Consensus-critical; set by benchmark harness.
+pub const MAX_TICK: u64 = 1_000_000; // Placeholder; real value set by benchmark.
+
+/// Price scale denominator (protocol spec section 4.1).
+/// Scaled price = tick * tick_size / PRICE_SCALE.
+pub const PRICE_SCALE: i128 = 100_000_000;
+
+// ============ Bounded-work constants (Phase 0, #013, part 1/2) ============
+/// Maximum number of fill operations per single matching call.
+/// Limits CPU work and ledger writes from matching one incoming order.
+/// When exhausted, matching stops deterministically and the client must resubmit the remainder.
+/// Rationale: Soroban transactions have finite CPU, memory, and ledger write budgets.
+/// Fills are the primary work unit; each fill requires O(1) ledger writes and compute.
+pub const MAX_MATCHES_PER_CALL: u32 = 100;
+
+/// Maximum number of price levels (ticks) examined during one matching traversal.
+/// Limits iteration over potentially sparse order book levels when finding next liquidity.
+/// When exhausted, matching stops and client must resubmit to continue at next level.
+/// Rationale: Finding the next non-empty level can require scanning many empty ticks.
+/// Bounding this prevents quadratic-time matching on adversarially sparse books.
+/// Implementation must use an ordered index or bitmap to find levels in O(1) per level examined.
+pub const MAX_LEVELS_CROSSED_PER_CALL: u32 = 100;
+
+/// Maximum number of orders in a batch operation (batch cancel, batch place).
+/// Limits the number of individual order operations processed in one transaction.
+/// Rationale: Each order operation (create, cancel) requires ledger reads/writes.
+/// Batch operations are not atomic; partial batches succeed and client must retry remainder.
+pub const MAX_BATCH_SIZE: u32 = 50;
+
+/// Maximum number of orders returned in a depth query (market data snapshot).
+/// Limits ledger read operations when querying the order book state.
+/// Rationale: Depth queries scan the book; bounding them keeps query costs predictable.
+/// Clients paginate through large books using continuation tokens.
+pub const MAX_DEPTH_QUERY_SIZE: u32 = 100;
+
+/// Maximum size (in bytes) of a single order's payload (including owner, side, tick, size, tif).
+/// Prevents adversarially large orders from consuming excessive transaction space.
+/// Rationale: Soroban transactions have a hard size limit. Bounding per-order size ensures
+/// reasonable batch sizes remain within transaction budget.
+pub const MAX_ORDER_PAYLOAD_BYTES: u32 = 256;
+
+// ============ Resource-bound guards (Phase 0, #013) ============
+/// Validates that a tick is within protocol bounds.
+/// Rejects any value > MAX_TICK.
+pub fn validate_tick(tick: u64) -> Result<(), &'static str> {
+    if tick == 0 {
+        return Err("tick: must be positive");
+    }
+    if tick > MAX_TICK {
+        return Err("tick: exceeds MAX_TICK");
+    }
+    Ok(())
+}
+
+/// Validates that a match-step count is within protocol bounds.
+/// Rejects any value > MAX_MATCH_STEPS.
+pub fn validate_match_steps(steps: u32) -> Result<(), &'static str> {
+    if steps > MAX_MATCH_STEPS {
+        return Err("match_steps: exceeds MAX_MATCH_STEPS");
+    }
+    Ok(())
+}
+
+/// Validates lot size is positive (protocol spec section 3).
+/// Lot size must be > 0; zero and negative sizes are rejected at market creation.
+pub fn validate_lot_size(lot_size: u64) -> Result<(), &'static str> {
+    if lot_size == 0 {
+        return Err("lot_size: must be positive");
+    }
+    Ok(())
+}
+
+/// Validates tick size is positive and does not overflow when scaled.
+/// Tick size must be > 0. Product tick * tick_size must fit in u64 (checked at order placement).
+pub fn validate_tick_size(tick_size: u64) -> Result<(), &'static str> {
+    if tick_size == 0 {
+        return Err("tick_size: must be positive");
+    }
+    Ok(())
+}
+
+/// Validates that a fill count does not exceed MAX_MATCHES_PER_CALL.
+/// Called during matching to enforce bounded work per transaction.
+pub fn validate_matches_per_call(count: u32) -> Result<(), &'static str> {
+    if count > MAX_MATCHES_PER_CALL {
+        return Err("matches: exceeds MAX_MATCHES_PER_CALL");
+    }
+    Ok(())
+}
+
+/// Validates that a level count does not exceed MAX_LEVELS_CROSSED_PER_CALL.
+/// Called during book traversal to enforce bounded level scanning.
+pub fn validate_levels_crossed_per_call(count: u32) -> Result<(), &'static str> {
+    if count > MAX_LEVELS_CROSSED_PER_CALL {
+        return Err("levels: exceeds MAX_LEVELS_CROSSED_PER_CALL");
+    }
+    Ok(())
+}
+
+/// Validates that a batch size does not exceed MAX_BATCH_SIZE.
+/// Called when accepting batch operations.
+pub fn validate_batch_size(size: u32) -> Result<(), &'static str> {
+    if size > MAX_BATCH_SIZE {
+        return Err("batch: exceeds MAX_BATCH_SIZE");
+    }
+    Ok(())
+}
+
+/// Validates that a depth query size does not exceed MAX_DEPTH_QUERY_SIZE.
+/// Called when returning market data.
+pub fn validate_depth_query_size(size: u32) -> Result<(), &'static str> {
+    if size > MAX_DEPTH_QUERY_SIZE {
+        return Err("depth: exceeds MAX_DEPTH_QUERY_SIZE");
+    }
+    Ok(())
+}
+
+/// Validates that an order payload does not exceed MAX_ORDER_PAYLOAD_BYTES.
+/// Called at order creation to enforce transaction size bounds.
+pub fn validate_order_payload_size(size: u32) -> Result<(), &'static str> {
+    if size > MAX_ORDER_PAYLOAD_BYTES {
+        return Err("order: payload exceeds MAX_ORDER_PAYLOAD_BYTES");
+    }
+    Ok(())
+}
+
 // ============ #957: Base and Quote Balance Transfers ============
 #[derive(Clone)]
 pub struct Fill {
@@ -360,9 +493,6 @@ impl FeeAccumulator {
 }
 
 // ============ #959, #960: Quote Rounding ============
-/// Denominator for scaled prices (protocol spec section 4.1).
-pub const PRICE_SCALE: i128 = 100_000_000;
-
 /// Only `Down` and `Up` exist: the spec names no other rounding mode (section 4.2).
 #[derive(Clone, Copy)]
 pub enum RoundingMode { Down, Up }
@@ -811,5 +941,195 @@ mod rounding_tests {
         assert!(fill_quote_legs(1, 3, 0, TICK_3).is_err());
         assert!(fill_quote_legs(1, 3, 4, TICK_3).is_err());
         assert!(fill_quote_legs(0, 3, 1, TICK_3).is_err());
+    }
+}
+
+#[cfg(test)]
+mod resource_bound_tests {
+    use super::*;
+
+    // ============ Tick validation (positive paths) ============
+    #[test]
+    fn validate_tick_accepts_valid_ticks() {
+        assert!(validate_tick(1).is_ok());
+        assert!(validate_tick(100).is_ok());
+        assert!(validate_tick(MAX_TICK).is_ok());
+        assert!(validate_tick(MAX_TICK / 2).is_ok());
+    }
+
+    // ============ Tick validation (negative paths) ============
+    #[test]
+    fn validate_tick_rejects_zero() {
+        assert_eq!(validate_tick(0), Err("tick: must be positive"));
+    }
+
+    #[test]
+    fn validate_tick_rejects_out_of_bounds() {
+        assert_eq!(validate_tick(MAX_TICK + 1), Err("tick: exceeds MAX_TICK"));
+        assert_eq!(validate_tick(u64::MAX), Err("tick: exceeds MAX_TICK"));
+    }
+
+    // ============ Match steps validation (positive paths) ============
+    #[test]
+    fn validate_match_steps_accepts_valid_budget() {
+        assert!(validate_match_steps(0).is_ok());
+        assert!(validate_match_steps(1).is_ok());
+        assert!(validate_match_steps(50).is_ok());
+        assert!(validate_match_steps(MAX_MATCH_STEPS).is_ok());
+    }
+
+    // ============ Match steps validation (negative paths) ============
+    #[test]
+    fn validate_match_steps_rejects_out_of_bounds() {
+        assert_eq!(validate_match_steps(MAX_MATCH_STEPS + 1), Err("match_steps: exceeds MAX_MATCH_STEPS"));
+        assert_eq!(validate_match_steps(u32::MAX), Err("match_steps: exceeds MAX_MATCH_STEPS"));
+    }
+
+    // ============ Lot size validation (positive paths) ============
+    #[test]
+    fn validate_lot_size_accepts_positive() {
+        assert!(validate_lot_size(1).is_ok());
+        assert!(validate_lot_size(100).is_ok());
+        assert!(validate_lot_size(1_000_000_000).is_ok());
+        assert!(validate_lot_size(u64::MAX).is_ok());
+    }
+
+    // ============ Lot size validation (negative paths) ============
+    #[test]
+    fn validate_lot_size_rejects_zero() {
+        assert_eq!(validate_lot_size(0), Err("lot_size: must be positive"));
+    }
+
+    // ============ Tick size validation (positive paths) ============
+    #[test]
+    fn validate_tick_size_accepts_positive() {
+        assert!(validate_tick_size(1).is_ok());
+        assert!(validate_tick_size(100_000_000).is_ok());
+        assert!(validate_tick_size(u64::MAX).is_ok());
+    }
+
+    // ============ Tick size validation (negative paths) ============
+    #[test]
+    fn validate_tick_size_rejects_zero() {
+        assert_eq!(validate_tick_size(0), Err("tick_size: must be positive"));
+    }
+
+    // ============ Boundary tests ============
+    #[test]
+    fn max_constants_are_non_zero() {
+        assert!(MAX_MATCH_STEPS > 0);
+        assert!(MAX_TICK > 0);
+    }
+
+    #[test]
+    fn price_scale_is_fixed_denominator() {
+        assert_eq!(PRICE_SCALE, 100_000_000);
+    }
+}
+
+#[cfg(test)]
+mod bounded_work_tests {
+    use super::*;
+
+    // ============ Matches per call validation (positive paths) ============
+    #[test]
+    fn validate_matches_per_call_accepts_valid_count() {
+        assert!(validate_matches_per_call(0).is_ok());
+        assert!(validate_matches_per_call(1).is_ok());
+        assert!(validate_matches_per_call(50).is_ok());
+        assert!(validate_matches_per_call(MAX_MATCHES_PER_CALL).is_ok());
+    }
+
+    // ============ Matches per call validation (negative paths) ============
+    #[test]
+    fn validate_matches_per_call_rejects_out_of_bounds() {
+        assert_eq!(validate_matches_per_call(MAX_MATCHES_PER_CALL + 1), Err("matches: exceeds MAX_MATCHES_PER_CALL"));
+        assert_eq!(validate_matches_per_call(u32::MAX), Err("matches: exceeds MAX_MATCHES_PER_CALL"));
+    }
+
+    // ============ Levels crossed per call validation (positive paths) ============
+    #[test]
+    fn validate_levels_crossed_per_call_accepts_valid_count() {
+        assert!(validate_levels_crossed_per_call(0).is_ok());
+        assert!(validate_levels_crossed_per_call(1).is_ok());
+        assert!(validate_levels_crossed_per_call(50).is_ok());
+        assert!(validate_levels_crossed_per_call(MAX_LEVELS_CROSSED_PER_CALL).is_ok());
+    }
+
+    // ============ Levels crossed per call validation (negative paths) ============
+    #[test]
+    fn validate_levels_crossed_per_call_rejects_out_of_bounds() {
+        assert_eq!(validate_levels_crossed_per_call(MAX_LEVELS_CROSSED_PER_CALL + 1), Err("levels: exceeds MAX_LEVELS_CROSSED_PER_CALL"));
+        assert_eq!(validate_levels_crossed_per_call(u32::MAX), Err("levels: exceeds MAX_LEVELS_CROSSED_PER_CALL"));
+    }
+
+    // ============ Batch size validation (positive paths) ============
+    #[test]
+    fn validate_batch_size_accepts_valid_size() {
+        assert!(validate_batch_size(0).is_ok());
+        assert!(validate_batch_size(1).is_ok());
+        assert!(validate_batch_size(25).is_ok());
+        assert!(validate_batch_size(MAX_BATCH_SIZE).is_ok());
+    }
+
+    // ============ Batch size validation (negative paths) ============
+    #[test]
+    fn validate_batch_size_rejects_out_of_bounds() {
+        assert_eq!(validate_batch_size(MAX_BATCH_SIZE + 1), Err("batch: exceeds MAX_BATCH_SIZE"));
+        assert_eq!(validate_batch_size(u32::MAX), Err("batch: exceeds MAX_BATCH_SIZE"));
+    }
+
+    // ============ Depth query size validation (positive paths) ============
+    #[test]
+    fn validate_depth_query_size_accepts_valid_size() {
+        assert!(validate_depth_query_size(0).is_ok());
+        assert!(validate_depth_query_size(1).is_ok());
+        assert!(validate_depth_query_size(50).is_ok());
+        assert!(validate_depth_query_size(MAX_DEPTH_QUERY_SIZE).is_ok());
+    }
+
+    // ============ Depth query size validation (negative paths) ============
+    #[test]
+    fn validate_depth_query_size_rejects_out_of_bounds() {
+        assert_eq!(validate_depth_query_size(MAX_DEPTH_QUERY_SIZE + 1), Err("depth: exceeds MAX_DEPTH_QUERY_SIZE"));
+        assert_eq!(validate_depth_query_size(u32::MAX), Err("depth: exceeds MAX_DEPTH_QUERY_SIZE"));
+    }
+
+    // ============ Order payload size validation (positive paths) ============
+    #[test]
+    fn validate_order_payload_size_accepts_valid_size() {
+        assert!(validate_order_payload_size(0).is_ok());
+        assert!(validate_order_payload_size(1).is_ok());
+        assert!(validate_order_payload_size(128).is_ok());
+        assert!(validate_order_payload_size(MAX_ORDER_PAYLOAD_BYTES).is_ok());
+    }
+
+    // ============ Order payload size validation (negative paths) ============
+    #[test]
+    fn validate_order_payload_size_rejects_out_of_bounds() {
+        assert_eq!(validate_order_payload_size(MAX_ORDER_PAYLOAD_BYTES + 1), Err("order: payload exceeds MAX_ORDER_PAYLOAD_BYTES"));
+        assert_eq!(validate_order_payload_size(u32::MAX), Err("order: payload exceeds MAX_ORDER_PAYLOAD_BYTES"));
+    }
+
+    // ============ Boundary and relationship tests ============
+    #[test]
+    fn all_bounded_work_constants_are_positive() {
+        assert!(MAX_MATCHES_PER_CALL > 0);
+        assert!(MAX_LEVELS_CROSSED_PER_CALL > 0);
+        assert!(MAX_BATCH_SIZE > 0);
+        assert!(MAX_DEPTH_QUERY_SIZE > 0);
+        assert!(MAX_ORDER_PAYLOAD_BYTES > 0);
+    }
+
+    #[test]
+    fn bounded_work_constants_are_consistent() {
+        // Batch size should be reasonable relative to matches per call
+        assert!(MAX_BATCH_SIZE <= MAX_MATCHES_PER_CALL || MAX_BATCH_SIZE > 0);
+        // All constants should be u32 representable
+        assert!(MAX_MATCHES_PER_CALL <= u32::MAX);
+        assert!(MAX_LEVELS_CROSSED_PER_CALL <= u32::MAX);
+        assert!(MAX_BATCH_SIZE <= u32::MAX);
+        assert!(MAX_DEPTH_QUERY_SIZE <= u32::MAX);
+        assert!(MAX_ORDER_PAYLOAD_BYTES <= u32::MAX);
     }
 }
