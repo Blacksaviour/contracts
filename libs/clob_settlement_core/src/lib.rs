@@ -879,6 +879,60 @@ mod fee_settlement_tests {
         }
         assert_eq!(taker_fees, config.taker_fee(3).unwrap());
     }
+    #[test]
+    fn arithmetic_failure_after_fee_calculation_rolls_back_ledger_and_accumulator() {
+        let env = Env::default();
+        let quote_token = Address::generate(&env);
+        let config = MarketFeeConfig::new(1, 1).unwrap();
+        let fill = Fill {
+            maker: Address::generate(&env),
+            taker: Address::generate(&env),
+            base_amount: 1,
+            // Taker quote + fee overflows only after fee calculations have succeeded.
+            quote_amount: i128::MAX,
+            maker_is_sell: true,
+        };
+        let mut ledger = empty_ledger();
+        let mut accumulator = FeeAccumulator::new(quote_token);
+        let before_base = ledger.base_transfers.len();
+        let before_quote = ledger.quote_transfers.len();
+        let before_liabilities = ledger.fee_liabilities.len();
+
+        assert!(fill
+            .settle_with_fee_and_accumulator(&mut ledger, &mut accumulator, &config, 0)
+            .is_err());
+        assert_eq!(ledger.base_transfers.len(), before_base);
+        assert_eq!(ledger.quote_transfers.len(), before_quote);
+        assert_eq!(ledger.fee_liabilities.len(), before_liabilities);
+        assert_eq!(accumulator.accrued, 0);
+    }
+
+    #[test]
+    fn fee_accumulator_overflow_rolls_back_all_ledger_mutations() {
+        let env = Env::default();
+        let quote_token = Address::generate(&env);
+        let config = MarketFeeConfig::new(1, 1).unwrap();
+        let fill = Fill {
+            maker: Address::generate(&env),
+            taker: Address::generate(&env),
+            base_amount: 2,
+            quote_amount: 100,
+            maker_is_sell: true,
+        };
+        let mut ledger = empty_ledger();
+        let mut accumulator = FeeAccumulator::new(quote_token);
+        accumulator.accrued = i128::MAX;
+        let before = ledger.clone();
+
+        assert!(fill
+            .settle_with_fee_and_accumulator(&mut ledger, &mut accumulator, &config, 0)
+            .is_err());
+        assert_eq!(ledger.base_transfers.len(), before.base_transfers.len());
+        assert_eq!(ledger.quote_transfers.len(), before.quote_transfers.len());
+        assert_eq!(ledger.fee_liabilities.len(), before.fee_liabilities.len());
+        assert_eq!(accumulator.accrued, i128::MAX);
+    }
+
 }
 
 #[cfg(test)]
