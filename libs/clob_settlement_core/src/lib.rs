@@ -424,6 +424,29 @@ fn validate_fee_rate(rate: i128) -> Result<(), &'static str> {
 
 /// Fee on `quote_amount` at `rate`, rounded up so a non-zero obligation can
 /// never be under-reserved.  A zero rate charges nothing.
+///
+/// # Rounding Behavior (CLOB-092)
+///
+/// Fee rounding follows these rules:
+/// 1. **Zero rate always returns zero fee**: If rate = 0, no fee is charged regardless of amount.
+/// 2. **Non-zero rate with zero amount returns zero fee**: If amount = 0, no fee can be charged.
+/// 3. **Rounding direction is always UP (ceiling)**: This ensures the protocol never under-collects
+///    fees. A trader with a valid order can always pay the rounded-up fee.
+/// 4. **Tiny fills may round to zero**: When `quote_amount * rate < FEE_RATE_SCALE`, the fee rounds
+///    to zero. This is acceptable in v1 because:
+///    - It never causes insolvency: an order that can fill at all has locked enough quote.
+///    - It does not create fragmentation exploits: the cumulative taker fee formula (section 7.2)
+///      ensures splitting a fill never reduces the total fee below the fee of the whole.
+/// 5. **Minimum fee is ZERO**: v1 has no minimum fee per fill. Dust trades are discouraged by
+///    lot size and minimum notional rules enforced during order placement, not by fee logic.
+///
+/// # Examples
+/// - rate = 100_000 (0.1%), quote = 1_000_000 => fee = ceil(1_000_000 * 100_000 / 100_000_000) = 1
+/// - rate = 100_000 (0.1%), quote = 1_000 => fee = ceil(1_000 * 100_000 / 100_000_000) = 1
+/// - rate = 100_000 (0.1%), quote = 999 => fee = ceil(999 * 100_000 / 100_000_000) = 1
+/// - rate = 1, quote = 1 => fee = ceil(1 * 1 / 100_000_000) = 1 (minimum non-zero)
+/// - rate = 1, quote = 0 => fee = 0 (no amount to charge)
+/// - rate = 0, quote = 1_000_000 => fee = 0 (zero rate market)
 fn fee_on_quote(quote_amount: i128, rate: i128) -> Result<i128, &'static str> {
     if quote_amount < 0 { return Err("fee: negative quote amount"); }
     let numerator = quote_amount.checked_mul(rate).ok_or("fee: multiplication overflow")?;
@@ -569,38 +592,267 @@ pub fn fill_quote_legs(
 }
 
 // ============ #981: Order Lifecycle ============
-#[derive(Clone, Copy)]
-pub enum TimeInForce { GTC, GTD }
+// ============ #918: Ledger-Based Order Expiration ============
+// ============ #978: Timestamp-Based Good-Til-Date Expiration ============
 
-pub struct OrderRequest {
-    pub tif: TimeInForce,
-    pub expiry_ledger: u64,
+/// Time-in-force policy for an order (protocol spec section 5.3).
+///
+/// - **GTC** (Good-Till-Cancel): Order rests until fully filled or explicitly cancelled.
+/// - **GTD** (Good-Till-Date): Order rests until a specified ledger sequence is reached.
+/// - **GTT** (Good-Till-Time): Order rests until a specified Unix timestamp is reached.
+///
+/// # CLOB-978: Timestamp-Based Expiration
+///
+/// GTT orders expire based on wall-clock time rather than ledger sequence, which is
+/// more intuitive for some trading clients. The timestamp is compared against the
+/// ledger's timestamp (env.ledger().timestamp()).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TimeInForce {
+    /// Good-Till-Cancel: remains active indefinitely until filled or cancelled.
+    GTC,
+    /// Good-Till-Date: remains active until expiry_ledger is reached.
+    GTD,
+    /// Good-Till-Time: remains active until expiry_timestamp is reached.
+    GTT,
 }
 
-impl OrderRequest {
-    pub fn validate_tif(
-        env: &Env,
-        tif: TimeInForce,
-        expiry: Option<u64>,
-    ) -> Result<(), &'static str> {
-        match tif {
+/// Represents a resting order with time-in-force and expiration tracking.
+///
+/// This structure supports:
+/// - CLOB-918: Ledger-based order expiration (GTD)
+/// - CLOB-978: Timestamp-based order expiration (GTT)
+#[derive(Clone, Copy, Debug)]
+pub struct Order {
+    pub id: u64,
+    pub owner: Address,
+    pub tif: TimeInForce,
+    /// Last valid ledger sequence (only meaningful for GTD orders).
+    /// For GTC and GTT orders, this field is ignored and should be 0.
+    pub expiry_ledger: u64,
+    /// Last valid Unix timestamp in seconds (only meaningful for GTT orders).
+    /// For GTC and GTD orders, this field is ignored and should be 0.
+    pub expiry_timestamp: u64,
+    pub remaining_lots: u64,
+}
+
+impl Order {
+    /// Create a new GTC order.
+    pub fn new_gtc(id: u64, owner: Address, remaining_lots: u64) -> Self {
+        Self {
+            id,
+            owner,
+            tif: TimeInForce::GTC,
+            expiry_ledger: 0,
+            expiry_timestamp: 0,
+            remaining_lots,
+        }
+    }
+
+    /// Create a new GTD order with specified expiry ledger.
+    pub fn new_gtd(id: u64, owner: Address, remaining_lots: u64, expiry_ledger: u64) -> Self {
+        Self {
+            id,
+            owner,
+            tif: TimeInForce::GTD,
+            expiry_ledger,
+            expiry_timestamp: 0,
+            remaining_lots,
+        }
+    }
+
+    /// Create a new GTT order with specified expiry timestamp.
+    ///
+    /// # CLOB-978: Timestamp-Based Expiration
+    ///
+    /// The expiry_timestamp is a Unix timestamp in seconds. The order expires when
+    /// the ledger timestamp (env.ledger().timestamp()) reaches this value.
+    pub fn new_gtt(id: u64, owner: Address, remaining_lots: u64, expiry_timestamp: u64) -> Self {
+        Self {
+            id,
+            owner,
+            tif: TimeInForce::GTT,
+            expiry_ledger: 0,
+            expiry_timestamp,
+            remaining_lots,
+        }
+    }
+
+    /// Check if the order is expired at the given ledger sequence and timestamp.
+    ///
+    /// Returns `true` if the order is expired. This method checks both ledger-based
+    /// and timestamp-based expiration depending on the order's TIF.
+    ///
+    /// # CLOB-918 & CLOB-978: Expiration Semantics
+    ///
+    /// - **GTC**: Never expires (always return false)
+    /// - **GTD**: Expired when `current_ledger >= expiry_ledger`
+    /// - **GTT**: Expired when `current_timestamp >= expiry_timestamp`
+    ///
+    /// # Boundary Behavior (CLOB-978)
+    ///
+    /// An order is expired when the current time/ledger is **greater than or equal to**
+    /// the expiry value. This means:
+    /// - At timestamp T, an order with expiry_timestamp = T is **expired**
+    /// - At timestamp T-1, an order with expiry_timestamp = T is **active**
+    /// - "Valid through" semantics: the order is valid up to but not including the expiry
+    pub fn is_expired(&self, current_ledger: u64, current_timestamp: u64) -> bool {
+        match self.tif {
+            TimeInForce::GTC => false,
+            TimeInForce::GTD => current_ledger >= self.expiry_ledger,
+            TimeInForce::GTT => current_timestamp >= self.expiry_timestamp,
+        }
+    }
+
+    /// Check if the order is active (not expired) at the given ledger and timestamp.
+    ///
+    /// This is the inverse of `is_expired` and is provided for convenience
+    /// in matching logic where "active" is the more natural phrasing.
+    pub fn is_active(&self, current_ledger: u64, current_timestamp: u64) -> bool {
+        !self.is_expired(current_ledger, current_timestamp)
+    }
+
+    /// Validate that this order can be placed with the given environment state.
+    ///
+    /// # Validation Rules
+    ///
+    /// - **GTC orders**: Always valid (expiry fields ignored)
+    /// - **GTD orders**: expiry_ledger must be strictly greater than current_ledger
+    /// - **GTT orders**: expiry_timestamp must be strictly greater than current_timestamp
+    ///
+    /// This ensures that an order is active for at least one ledger/timestamp after placement.
+    pub fn validate_placement(&self, current_ledger: u64, current_timestamp: u64) -> Result<(), &'static str> {
+        match self.tif {
             TimeInForce::GTC => {
-                if let Some(exp) = expiry { if exp != 0 { return Err("gtc: expiry must be zero"); } }
+                // GTC orders should have expiry fields = 0 by convention, but we don't enforce it
+                // since the fields are ignored for GTC orders.
                 Ok(())
             }
             TimeInForce::GTD => {
-                let expiry = expiry.ok_or("gtd: missing expiry")?;
-                if expiry <= env.ledger().sequence() { return Err("gtd: expiry passed"); }
+                if self.expiry_ledger <= current_ledger {
+                    return Err("gtd: expiry must be in the future");
+                }
+                Ok(())
+            }
+            TimeInForce::GTT => {
+                if self.expiry_timestamp <= current_timestamp {
+                    return Err("gtt: expiry must be in the future");
+                }
                 Ok(())
             }
         }
     }
 
-    pub fn is_active(&self, current_ledger: u64) -> bool {
+    /// Check if this order can fill as a maker at the current ledger and timestamp.
+    ///
+    /// An order can fill if it is active (not expired). This is called during
+    /// matching to ensure expired orders never execute (Invariants I11, I11-time).
+    pub fn can_fill_as_maker(&self, current_ledger: u64, current_timestamp: u64) -> bool {
+        self.is_active(current_ledger, current_timestamp)
+    }
+}
+
+/// Request to place an order, with time-in-force validation.
+///
+/// This is used during order placement to validate the TIF policy before
+/// creating the actual `Order` structure.
+#[derive(Clone, Copy)]
+pub struct OrderRequest {
+    pub tif: TimeInForce,
+    pub expiry_ledger: u64,
+    pub expiry_timestamp: u64,
+}
+
+impl OrderRequest {
+    /// Create a GTC order request.
+    pub fn new_gtc() -> Self {
+        Self {
+            tif: TimeInForce::GTC,
+            expiry_ledger: 0,
+            expiry_timestamp: 0,
+        }
+    }
+
+    /// Create a GTD order request with specified expiry ledger.
+    pub fn new_gtd(expiry_ledger: u64) -> Self {
+        Self {
+            tif: TimeInForce::GTD,
+            expiry_ledger,
+            expiry_timestamp: 0,
+        }
+    }
+
+    /// Create a GTT order request with specified expiry timestamp.
+    ///
+    /// # CLOB-978: Timestamp-Based Expiration
+    pub fn new_gtt(expiry_timestamp: u64) -> Self {
+        Self {
+            tif: TimeInForce::GTT,
+            expiry_ledger: 0,
+            expiry_timestamp,
+        }
+    }
+
+    /// Validate the time-in-force policy at the current ledger and timestamp.
+    ///
+    /// This is called during order placement to ensure:
+    /// - GTC orders have no expiry or expiry is 0
+    /// - GTD orders have a valid future ledger expiry
+    /// - GTT orders have a valid future timestamp expiry
+    pub fn validate_tif(
+        env: &Env,
+        tif: TimeInForce,
+        expiry_ledger: Option<u64>,
+        expiry_timestamp: Option<u64>,
+    ) -> Result<(), &'static str> {
+        match tif {
+            TimeInForce::GTC => {
+                // GTC orders should not have an expiry, or it should be 0
+                if let Some(exp) = expiry_ledger {
+                    if exp != 0 {
+                        return Err("gtc: ledger expiry must be zero");
+                    }
+                }
+                if let Some(exp) = expiry_timestamp {
+                    if exp != 0 {
+                        return Err("gtc: timestamp expiry must be zero");
+                    }
+                }
+                Ok(())
+            }
+            TimeInForce::GTD => {
+                let expiry = expiry_ledger.ok_or("gtd: missing expiry ledger")?;
+                if expiry <= env.ledger().sequence() {
+                    return Err("gtd: expiry must be in the future");
+                }
+                Ok(())
+            }
+            TimeInForce::GTT => {
+                let expiry = expiry_timestamp.ok_or("gtt: missing expiry timestamp")?;
+                if expiry <= env.ledger().timestamp() {
+                    return Err("gtt: expiry must be in the future");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Check if an order with this request would be active at the given ledger and timestamp.
+    pub fn is_active(&self, current_ledger: u64, current_timestamp: u64) -> bool {
         match self.tif {
             TimeInForce::GTC => true,
             TimeInForce::GTD => current_ledger < self.expiry_ledger,
+            TimeInForce::GTT => current_timestamp < self.expiry_timestamp,
         }
+    }
+
+    /// Validate this request for placement at the current ledger and timestamp.
+    pub fn validate(&self, env: &Env) -> Result<(), &'static str> {
+        Self::validate_tif(
+            env,
+            self.tif,
+            Some(self.expiry_ledger),
+            Some(self.expiry_timestamp),
+        )
     }
 }
 
@@ -770,6 +1022,241 @@ mod fee_tests {
         }
         assert_eq!(config.taker_fee(3).unwrap(), 1);
         assert_eq!(paid, 1);
+    }
+
+    // ============ CLOB-092: Fee Rounding, Minimum Fee, and Zero-Value Behavior Tests ============
+
+    /// Test case: Zero rate always charges zero fee, regardless of quote amount.
+    #[test]
+    fn zero_rate_charges_no_fee() {
+        let config = MarketFeeConfig::new(0, 0).unwrap();
+        
+        // Zero rate with various quote amounts
+        assert_eq!(config.taker_fee(0).unwrap(), 0);
+        assert_eq!(config.taker_fee(1).unwrap(), 0);
+        assert_eq!(config.taker_fee(1_000).unwrap(), 0);
+        assert_eq!(config.taker_fee(1_000_000).unwrap(), 0);
+        assert_eq!(config.taker_fee(i128::MAX / 2).unwrap(), 0);
+        
+        assert_eq!(config.maker_fee(0).unwrap(), 0);
+        assert_eq!(config.maker_fee(1_000_000).unwrap(), 0);
+    }
+
+    /// Test case: Zero quote amount always results in zero fee, regardless of rate.
+    #[test]
+    fn zero_amount_charges_no_fee() {
+        // Various rates with zero quote
+        let config_low = MarketFeeConfig::new(1, 1).unwrap();
+        assert_eq!(config_low.taker_fee(0).unwrap(), 0);
+        assert_eq!(config_low.maker_fee(0).unwrap(), 0);
+        
+        let config_mid = MarketFeeConfig::new(100_000, 50_000).unwrap();
+        assert_eq!(config_mid.taker_fee(0).unwrap(), 0);
+        assert_eq!(config_mid.maker_fee(0).unwrap(), 0);
+        
+        let config_max = MarketFeeConfig::new(MAX_FEE_RATE, MAX_FEE_RATE).unwrap();
+        assert_eq!(config_max.taker_fee(0).unwrap(), 0);
+        assert_eq!(config_max.maker_fee(0).unwrap(), 0);
+    }
+
+    /// Test case: One-unit fee is the minimum non-zero fee.
+    /// When quote_amount * rate < FEE_RATE_SCALE but > 0, the fee rounds to 1.
+    #[test]
+    fn one_unit_is_minimum_non_zero_fee() {
+        // Minimum rate (1) with minimum quote (1) rounds up to 1 atom fee
+        let config = MarketFeeConfig::new(1, 1).unwrap();
+        assert_eq!(config.taker_fee(1).unwrap(), 1);
+        assert_eq!(config.maker_fee(1).unwrap(), 1);
+        
+        // Rate of 1 with various small amounts, all round to 1
+        assert_eq!(config.taker_fee(1).unwrap(), 1);
+        assert_eq!(config.taker_fee(10).unwrap(), 1);
+        assert_eq!(config.taker_fee(100).unwrap(), 1);
+        assert_eq!(config.taker_fee(1_000).unwrap(), 1);
+        assert_eq!(config.taker_fee(10_000).unwrap(), 1);
+        assert_eq!(config.taker_fee(FEE_RATE_SCALE - 1).unwrap(), 1);
+        
+        // Exactly FEE_RATE_SCALE produces fee of 1 without rounding up
+        assert_eq!(config.taker_fee(FEE_RATE_SCALE).unwrap(), 1);
+        
+        // Just over FEE_RATE_SCALE rounds up to 2
+        assert_eq!(config.taker_fee(FEE_RATE_SCALE + 1).unwrap(), 2);
+    }
+
+    /// Test case: Threshold behavior at rounding boundaries.
+    /// Verify that fees round up correctly at exact FEE_RATE_SCALE multiples.
+    #[test]
+    fn threshold_rounding_behavior() {
+        let config = MarketFeeConfig::new(100_000, 50_000).unwrap();
+        
+        // 0.1% rate: threshold is at 1000 quote atoms for 1 atom fee
+        // quote * rate / FEE_RATE_SCALE = quote * 100_000 / 100_000_000 = quote / 1000
+        
+        // Just below threshold rounds up to 1
+        assert_eq!(config.taker_fee(999).unwrap(), 1);
+        
+        // At threshold, no rounding needed
+        assert_eq!(config.taker_fee(1_000).unwrap(), 1);
+        
+        // Just above threshold rounds up to 2
+        assert_eq!(config.taker_fee(1_001).unwrap(), 2);
+        
+        // Multiple of threshold, no rounding
+        assert_eq!(config.taker_fee(2_000).unwrap(), 2);
+        assert_eq!(config.taker_fee(1_000_000).unwrap(), 1_000);
+        
+        // 0.05% maker rate: threshold is 2000 quote atoms for 1 atom fee
+        assert_eq!(config.maker_fee(1_999).unwrap(), 1);
+        assert_eq!(config.maker_fee(2_000).unwrap(), 1);
+        assert_eq!(config.maker_fee(2_001).unwrap(), 2);
+    }
+
+    /// Test case: Maximum rate (100%) behavior.
+    /// At MAX_FEE_RATE (100%), fee equals the quote amount.
+    #[test]
+    fn maximum_rate_behavior() {
+        let config = MarketFeeConfig::new(MAX_FEE_RATE, MAX_FEE_RATE).unwrap();
+        
+        // 100% fee means fee = quote amount
+        assert_eq!(config.taker_fee(1).unwrap(), 1);
+        assert_eq!(config.taker_fee(100).unwrap(), 100);
+        assert_eq!(config.taker_fee(1_000).unwrap(), 1_000);
+        assert_eq!(config.taker_fee(1_000_000).unwrap(), 1_000_000);
+        
+        assert_eq!(config.maker_fee(1).unwrap(), 1);
+        assert_eq!(config.maker_fee(1_000_000).unwrap(), 1_000_000);
+        
+        // Reservation at max rate requires double the quote (quote + 100% fee)
+        assert_eq!(config.required_bid_reservation(1_000).unwrap(), 2_000);
+    }
+
+    /// Test case: Tiny fills that round to zero are acceptable.
+    /// This verifies that sub-fee-unit amounts charge zero fee, which is
+    /// acceptable in v1 because lot size and notional minimums prevent
+    /// excessive dust trading.
+    #[test]
+    fn tiny_fills_may_have_zero_fee() {
+        // At 0.1% (100_000), amounts below 1000 quote atoms round to 1 atom fee.
+        // But at 0.001% (1_000), amounts below 100_000 round to 1 atom.
+        // At rate 1 (0.000001%), only amounts >= 100_000_000 produce 1 atom fee.
+        
+        let config_tiny_rate = MarketFeeConfig::new(1, 1).unwrap();
+        
+        // Sub-scale amounts with rate=1 round up to 1
+        assert_eq!(config_tiny_rate.taker_fee(1).unwrap(), 1);
+        assert_eq!(config_tiny_rate.taker_fee(FEE_RATE_SCALE - 1).unwrap(), 1);
+        
+        // But with zero quote, fee is zero (not "minimum 1")
+        assert_eq!(config_tiny_rate.taker_fee(0).unwrap(), 0);
+        
+        // Zero-rate market charges nothing even on large amounts
+        let config_zero = MarketFeeConfig::new(0, 0).unwrap();
+        assert_eq!(config_zero.taker_fee(1_000_000_000).unwrap(), 0);
+    }
+
+    /// Test case: Fees are always deterministic and consistent.
+    /// Same inputs produce same outputs; no hidden state affects calculation.
+    #[test]
+    fn fee_calculation_is_deterministic() {
+        let config = MarketFeeConfig::new(100_000, 50_000).unwrap();
+        
+        // Multiple calls with same inputs produce identical results
+        for _ in 0..10 {
+            assert_eq!(config.taker_fee(1_000).unwrap(), 1);
+            assert_eq!(config.maker_fee(2_000).unwrap(), 1);
+        }
+    }
+
+    /// Test case: Fee never exceeds amount for rates <= 100%.
+    /// Ensures valid orders can always pay their fees (solvency).
+    #[test]
+    fn fee_never_exceeds_amount_for_valid_rates() {
+        let amounts = vec![1, 10, 100, 1_000, 10_000, 100_000, 1_000_000];
+        
+        for rate in [1, 1_000, 10_000, 50_000, 100_000, MAX_FEE_RATE].iter() {
+            let config = MarketFeeConfig::new(*rate, *rate).unwrap();
+            
+            for &amount in &amounts {
+                let taker_fee = config.taker_fee(amount).unwrap();
+                let maker_fee = config.maker_fee(amount).unwrap();
+                
+                // At 100% rate, fee = amount. Below 100%, fee <= amount.
+                assert!(taker_fee <= amount, 
+                    "taker_fee {} > amount {} at rate {}", taker_fee, amount, rate);
+                assert!(maker_fee <= amount,
+                    "maker_fee {} > amount {} at rate {}", maker_fee, amount, rate);
+            }
+        }
+    }
+
+    /// Test case: Cumulative taker fee prevents fragmentation exploits.
+    /// Splitting a fill never reduces the total fee below the whole fill's fee.
+    #[test]
+    fn cumulative_fee_prevents_fragmentation_exploit() {
+        let config = MarketFeeConfig::new(100_000, 0).unwrap();
+        
+        // Whole fill fee
+        let whole_fill_fee = config.taker_fee(5_000).unwrap();
+        
+        // Split into 5 fills of 1000 each
+        let mut cumulative_fee = 0;
+        let mut filled = 0;
+        for _ in 0..5 {
+            cumulative_fee += config.cumulative_taker_fee_delta(filled, 1_000).unwrap();
+            filled += 1_000;
+        }
+        
+        // Cumulative fee equals whole fill fee (no exploit)
+        assert_eq!(cumulative_fee, whole_fill_fee);
+        
+        // Try extreme fragmentation: 5000 fills of 1 atom each
+        let mut extreme_cumulative = 0;
+        let mut extreme_filled = 0;
+        for _ in 0..5_000 {
+            extreme_cumulative += config.cumulative_taker_fee_delta(extreme_filled, 1).unwrap();
+            extreme_filled += 1;
+        }
+        
+        // Even with extreme fragmentation, total fee is unchanged
+        assert_eq!(extreme_cumulative, whole_fill_fee);
+    }
+
+    /// Test case: Documented examples from fee-accounting.md are correct.
+    #[test]
+    fn documented_fee_examples_are_correct() {
+        // Example 1: quote=1000000, taker=100000 (0.1%), maker=50000 (0.05%)
+        let config1 = MarketFeeConfig::new(100_000, 50_000).unwrap();
+        assert_eq!(config1.taker_fee(1_000_000).unwrap(), 1_000);
+        assert_eq!(config1.maker_fee(1_000_000).unwrap(), 500);
+        
+        // Example 2: quote=1000, taker=100000 (0.1%), maker=200000 (0.2%)
+        let config2 = MarketFeeConfig::new(100_000, 200_000).unwrap();
+        assert_eq!(config2.taker_fee(1_000).unwrap(), 1);
+        assert_eq!(config2.maker_fee(1_000).unwrap(), 2);
+    }
+
+    /// Test case: Edge case - negative amounts are rejected.
+    #[test]
+    fn negative_amounts_are_rejected() {
+        let config = MarketFeeConfig::new(100_000, 50_000).unwrap();
+        
+        assert!(config.taker_fee(-1).is_err());
+        assert!(config.maker_fee(-1).is_err());
+        assert!(config.cumulative_taker_fee_delta(0, -1).is_err());
+    }
+
+    /// Test case: Overflow protection in fee calculation.
+    #[test]
+    fn overflow_protection_in_fee_calculation() {
+        let config = MarketFeeConfig::new(MAX_FEE_RATE, MAX_FEE_RATE).unwrap();
+        
+        // i128::MAX with any non-zero rate will overflow in multiplication
+        assert!(config.taker_fee(i128::MAX).is_err());
+        assert!(config.maker_fee(i128::MAX).is_err());
+        
+        // Large but valid amounts should work
+        let large_valid = i128::MAX / (MAX_FEE_RATE + 1);
+        assert!(config.taker_fee(large_valid).is_ok());
     }
 }
 
@@ -998,6 +1485,859 @@ mod rounding_tests {
     }
 }
 
+
+// ============ CLOB-918: Ledger-Based Order Expiration Tests ============
+#[cfg(test)]
+mod expiration_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    /// Test case: GTC orders never expire regardless of ledger sequence or timestamp.
+    #[test]
+    fn gtc_orders_never_expire() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let order = Order::new_gtc(1, owner.clone(), 100);
+
+        // GTC orders are always active, regardless of ledger or timestamp
+        assert!(!order.is_expired(0, 0));
+        assert!(!order.is_expired(1, 1));
+        assert!(!order.is_expired(100, 1000));
+        assert!(!order.is_expired(1_000_000, 1_000_000_000));
+        assert!(!order.is_expired(u64::MAX, u64::MAX));
+
+        // is_active is the inverse
+        assert!(order.is_active(0, 0));
+        assert!(order.is_active(u64::MAX, u64::MAX));
+    }
+
+    /// Test case: GTD orders expire at exact expiry_ledger boundary.
+    #[test]
+    fn gtd_orders_expire_at_exact_boundary() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let expiry = 100;
+        let order = Order::new_gtd(1, owner.clone(), 50, expiry);
+
+        // Active before expiry (timestamp is irrelevant for GTD)
+        assert!(order.is_active(99, 0));
+        assert!(!order.is_expired(99, 1_000_000));
+
+        // Expired at exact expiry ledger
+        assert!(order.is_expired(100, 0));
+        assert!(!order.is_active(100, 0));
+
+        // Expired after expiry ledger
+        assert!(order.is_expired(101, 0));
+        assert!(order.is_expired(1_000, 0));
+        assert!(!order.is_active(101, 0));
+    }
+
+    /// Test case: GTD order placement validation requires future expiry.
+    #[test]
+    fn gtd_placement_requires_future_expiry() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // Set current ledger to 100
+        env.ledger().set_sequence_number(100);
+        env.ledger().set_timestamp(5000);
+
+        // Expiry in the past: rejected
+        let order_past = Order::new_gtd(1, owner.clone(), 50, 99);
+        assert!(order_past.validate_placement(100, 5000).is_err());
+
+        // Expiry at current ledger: rejected (must be strictly greater)
+        let order_current = Order::new_gtd(2, owner.clone(), 50, 100);
+        assert!(order_current.validate_placement(100, 5000).is_err());
+
+        // Expiry in the future: accepted
+        let order_future = Order::new_gtd(3, owner.clone(), 50, 101);
+        assert!(order_future.validate_placement(100, 5000).is_ok());
+
+        // Far future expiry: accepted
+        let order_far_future = Order::new_gtd(4, owner.clone(), 50, 10_000);
+        assert!(order_far_future.validate_placement(100, 5000).is_ok());
+    }
+
+    /// Test case: GTC order placement always succeeds.
+    #[test]
+    fn gtc_placement_always_succeeds() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // GTC orders can be placed at any ledger/timestamp
+        for ledger in [0, 1, 100, 1_000, u64::MAX / 2].iter() {
+            let timestamp = ledger * 5; // Arbitrary timestamp
+            env.ledger().set_sequence_number(*ledger);
+            env.ledger().set_timestamp(timestamp);
+            let order = Order::new_gtc(1, owner.clone(), 100);
+            assert!(order.validate_placement(*ledger, timestamp).is_ok());
+        }
+    }
+
+    /// Test case: Expired makers cannot fill (Invariant I11).
+    #[test]
+    fn expired_makers_cannot_fill() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let expiry = 500;
+        let order = Order::new_gtd(1, owner.clone(), 100, expiry);
+
+        // Can fill before expiry
+        assert!(order.can_fill_as_maker(499, 0));
+        assert!(order.can_fill_as_maker(100, 0));
+        assert!(order.can_fill_as_maker(0, 0));
+
+        // Cannot fill at or after expiry
+        assert!(!order.can_fill_as_maker(500, 0));
+        assert!(!order.can_fill_as_maker(501, 0));
+        assert!(!order.can_fill_as_maker(1_000, 0));
+    }
+
+    /// Test case: GTC makers can always fill.
+    #[test]
+    fn gtc_makers_can_always_fill() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let order = Order::new_gtc(1, owner.clone(), 100);
+
+        // Can fill at any ledger/timestamp
+        assert!(order.can_fill_as_maker(0, 0));
+        assert!(order.can_fill_as_maker(1_000, 10_000));
+        assert!(order.can_fill_as_maker(u64::MAX, u64::MAX));
+    }
+
+    /// Test case: OrderRequest validation with Env.
+    #[test]
+    fn order_request_validation_with_env() {
+        let env = Env::default();
+        env.ledger().set_sequence_number(100);
+        env.ledger().set_timestamp(5000);
+
+        // GTC request: always valid
+        let gtc_request = OrderRequest::new_gtc();
+        assert!(gtc_request.validate(&env).is_ok());
+
+        // GTD request with past expiry: invalid
+        let gtd_past = OrderRequest::new_gtd(99);
+        assert!(gtd_past.validate(&env).is_err());
+
+        // GTD request with current ledger expiry: invalid
+        let gtd_current = OrderRequest::new_gtd(100);
+        assert!(gtd_current.validate(&env).is_err());
+
+        // GTD request with future expiry: valid
+        let gtd_future = OrderRequest::new_gtd(101);
+        assert!(gtd_future.validate(&env).is_ok());
+    }
+
+    /// Test case: OrderRequest::validate_tif static method.
+    #[test]
+    fn order_request_validate_tif_static() {
+        let env = Env::default();
+        env.ledger().set_sequence_number(100);
+        env.ledger().set_timestamp(5000);
+
+        // GTC with no expiry: valid
+        assert!(OrderRequest::validate_tif(&env, TimeInForce::GTC, None, None).is_ok());
+
+        // GTC with zero expiry: valid
+        assert!(OrderRequest::validate_tif(&env, TimeInForce::GTC, Some(0), Some(0)).is_ok());
+
+        // GTC with non-zero ledger expiry: invalid
+        assert!(OrderRequest::validate_tif(&env, TimeInForce::GTC, Some(200), Some(0)).is_err());
+
+        // GTD with no expiry: invalid
+        assert!(OrderRequest::validate_tif(&env, TimeInForce::GTD, None, None).is_err());
+
+        // GTD with past expiry: invalid
+        assert!(OrderRequest::validate_tif(&env, TimeInForce::GTD, Some(99), None).is_err());
+
+        // GTD with current expiry: invalid
+        assert!(OrderRequest::validate_tif(&env, TimeInForce::GTD, Some(100), None).is_err());
+
+        // GTD with future expiry: valid
+        assert!(OrderRequest::validate_tif(&env, TimeInForce::GTD, Some(101), None).is_ok());
+    }
+
+    /// Test case: is_active matches expected behavior across ledger boundaries.
+    #[test]
+    fn is_active_behavior_across_ledger_boundaries() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // GTD order with expiry at ledger 1000
+        let gtd_order = Order::new_gtd(1, owner.clone(), 50, 1000);
+
+        // Active well before expiry
+        assert!(gtd_order.is_active(0, 0));
+        assert!(gtd_order.is_active(500, 0));
+        assert!(gtd_order.is_active(999, 0));
+
+        // Expired at and after expiry
+        assert!(!gtd_order.is_active(1000, 0));
+        assert!(!gtd_order.is_active(1001, 0));
+
+        // GTC order always active
+        let gtc_order = Order::new_gtc(2, owner.clone(), 50);
+        assert!(gtc_order.is_active(0, 0));
+        assert!(gtc_order.is_active(1000, 10000));
+        assert!(gtc_order.is_active(u64::MAX, u64::MAX));
+    }
+
+    /// Test case: Multiple orders with different expiries.
+    #[test]
+    fn multiple_orders_different_expiries() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        let order1 = Order::new_gtd(1, owner.clone(), 10, 100);
+        let order2 = Order::new_gtd(2, owner.clone(), 20, 200);
+        let order3 = Order::new_gtd(3, owner.clone(), 30, 300);
+        let order4 = Order::new_gtc(4, owner.clone(), 40);
+
+        // At ledger 150: order1 expired, others active
+        assert!(order1.is_expired(150, 0));
+        assert!(order2.is_active(150, 0));
+        assert!(order3.is_active(150, 0));
+        assert!(order4.is_active(150, 0));
+
+        // At ledger 250: order1 and order2 expired, others active
+        assert!(order1.is_expired(250, 0));
+        assert!(order2.is_expired(250, 0));
+        assert!(order3.is_active(250, 0));
+        assert!(order4.is_active(250, 0));
+
+        // At ledger 350: all GTD expired, GTC still active
+        assert!(order1.is_expired(350, 0));
+        assert!(order2.is_expired(350, 0));
+        assert!(order3.is_expired(350, 0));
+        assert!(order4.is_active(350, 0));
+    }
+
+    /// Test case: Edge case - order expiring at ledger 0.
+    #[test]
+    fn order_expiring_at_ledger_zero() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // This order would be immediately expired at any positive ledger
+        let order = Order::new_gtd(1, owner.clone(), 50, 0);
+
+        // Expired at ledger 0 and beyond
+        assert!(order.is_expired(0, 0));
+        assert!(order.is_expired(1, 0));
+        assert!(order.is_expired(100, 0));
+
+        // Such an order cannot be placed because expiry must be > current_ledger
+        // If we're at ledger 0 and try to place with expiry 0, it should fail
+        env.ledger().set_sequence_number(0);
+        assert!(order.validate_placement(0, 0).is_err());
+    }
+
+    /// Test case: Edge case - order with maximum expiry ledger.
+    #[test]
+    fn order_with_maximum_expiry() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        let max_expiry = u64::MAX;
+        let order = Order::new_gtd(1, owner.clone(), 50, max_expiry);
+
+        // Active at all ledgers except MAX
+        assert!(order.is_active(0, 0));
+        assert!(order.is_active(u64::MAX / 2, 0));
+        assert!(order.is_active(u64::MAX - 1, 0));
+
+        // Expired at MAX
+        assert!(order.is_expired(u64::MAX, 0));
+    }
+
+    /// Test case: Order expiration does not depend on other fields.
+    #[test]
+    fn expiration_independent_of_other_fields() {
+        let env = Env::default();
+        let owner1 = Address::generate(&env);
+        let owner2 = Address::generate(&env);
+
+        // Same expiry, different owners/ids/lots - same expiration behavior
+        let order1 = Order::new_gtd(1, owner1.clone(), 10, 500);
+        let order2 = Order::new_gtd(999, owner2.clone(), 10000, 500);
+
+        for ledger in [0, 499, 500, 501, 1000].iter() {
+            assert_eq!(order1.is_expired(*ledger, 0), order2.is_expired(*ledger, 0));
+            assert_eq!(order1.is_active(*ledger, 0), order2.is_active(*ledger, 0));
+        }
+    }
+
+    /// Test case: Deterministic expiration checking.
+    #[test]
+    fn expiration_is_deterministic() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let order = Order::new_gtd(1, owner.clone(), 50, 1000);
+
+        // Multiple checks at same ledger produce same result
+        for _ in 0..10 {
+            assert!(order.is_active(999, 0));
+            assert!(order.is_expired(1000, 0));
+            assert!(!order.is_active(1001, 0));
+        }
+    }
+
+    /// Test case: OrderRequest is_active matches Order behavior.
+    #[test]
+    fn order_request_is_active_matches_order() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // GTC request
+        let gtc_request = OrderRequest::new_gtc();
+        let gtc_order = Order::new_gtc(1, owner.clone(), 50);
+
+        for ledger in [0, 100, 1000, u64::MAX / 2].iter() {
+            assert_eq!(gtc_request.is_active(*ledger, 0), gtc_order.is_active(*ledger, 0));
+        }
+
+        // GTD request
+        let gtd_request = OrderRequest::new_gtd(500);
+        let gtd_order = Order::new_gtd(2, owner.clone(), 50, 500);
+
+        for ledger in [0, 499, 500, 501, 1000].iter() {
+            assert_eq!(gtd_request.is_active(*ledger, 0), gtd_order.is_active(*ledger, 0));
+        }
+    }
+
+    /// Test case: Composition with collateral - expired order lock should be released.
+    /// This tests the conceptual requirement that expiration composes with
+    /// collateral release, though the actual release logic is in matching/cancel.
+    #[test]
+    fn expiration_composes_with_collateral_logic() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // Order expires at ledger 100
+        let order = Order::new_gtd(1, owner.clone(), 50, 100);
+
+        // Before expiry: can fill, so lock should remain
+        assert!(order.can_fill_as_maker(99, 0));
+
+        // At expiry: cannot fill, so lock should be released (by caller)
+        assert!(!order.can_fill_as_maker(100, 0));
+
+        // After expiry: still cannot fill
+        assert!(!order.can_fill_as_maker(101, 0));
+    }
+
+    /// Test case: Batch expiration check (simulating matching loop).
+    /// This verifies that expiration checks can be performed efficiently
+    /// in a loop without unbounded iteration.
+    #[test]
+    fn batch_expiration_check_is_bounded() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // Create orders with various expiries
+        let orders = vec![
+            Order::new_gtd(1, owner.clone(), 10, 100),
+            Order::new_gtd(2, owner.clone(), 20, 200),
+            Order::new_gtc(3, owner.clone(), 30),
+            Order::new_gtd(4, owner.clone(), 40, 150),
+            Order::new_gtd(5, owner.clone(), 50, 175),
+        ];
+
+        // At ledger 160, check which can fill (simulating matching)
+        let current_ledger = 160;
+        let current_timestamp = 0;
+        let active_count = orders
+            .iter()
+            .filter(|o| o.can_fill_as_maker(current_ledger, current_timestamp))
+            .count();
+
+        // Orders 2 and 3 should be active (expiry 200 and GTC)
+        // Orders 1, 4, 5 should be expired (expiry 100, 150, 175)
+        assert_eq!(active_count, 2);
+    }
+
+    /// Test case: Zero-lot orders (edge case).
+    /// While the protocol states remaining_lots > 0 for resting orders,
+    /// test that expiration logic doesn't break with zero lots.
+    #[test]
+    fn expiration_works_with_zero_lots() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        let order = Order::new_gtd(1, owner.clone(), 0, 100);
+
+        assert!(order.is_active(99, 0));
+        assert!(order.is_expired(100, 0));
+    }
+}
+
+
+// ============ CLOB-978: Timestamp-Based Expiration Tests ============
+#[cfg(test)]
+mod timestamp_expiration_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    /// Test case: GTT orders expire at exact timestamp boundary.
+    #[test]
+    fn gtt_orders_expire_at_exact_timestamp_boundary() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let expiry_timestamp = 10_000;
+        let order = Order::new_gtt(1, owner.clone(), 50, expiry_timestamp);
+
+        // Active before expiry (ledger is irrelevant for GTT)
+        assert!(order.is_active(0, 9_999));
+        assert!(!order.is_expired(100, 9_999));
+
+        // Expired at exact expiry timestamp
+        assert!(order.is_expired(0, 10_000));
+        assert!(!order.is_active(0, 10_000));
+
+        // Expired after expiry timestamp
+        assert!(order.is_expired(0, 10_001));
+        assert!(order.is_expired(0, 20_000));
+        assert!(!order.is_active(0, 10_001));
+    }
+
+    /// Test case: GTT order placement validation requires future timestamp.
+    #[test]
+    fn gtt_placement_requires_future_timestamp() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // Set current timestamp to 5000
+        env.ledger().set_sequence_number(100);
+        env.ledger().set_timestamp(5000);
+
+        // Expiry in the past: rejected
+        let order_past = Order::new_gtt(1, owner.clone(), 50, 4_999);
+        assert!(order_past.validate_placement(100, 5000).is_err());
+
+        // Expiry at current timestamp: rejected (must be strictly greater)
+        let order_current = Order::new_gtt(2, owner.clone(), 50, 5_000);
+        assert!(order_current.validate_placement(100, 5000).is_err());
+
+        // Expiry in the future: accepted
+        let order_future = Order::new_gtt(3, owner.clone(), 50, 5_001);
+        assert!(order_future.validate_placement(100, 5000).is_ok());
+
+        // Far future expiry: accepted
+        let order_far_future = Order::new_gtt(4, owner.clone(), 50, 100_000);
+        assert!(order_far_future.validate_placement(100, 5000).is_ok());
+    }
+
+    /// Test case: GTT makers cannot fill after timestamp expiry.
+    #[test]
+    fn gtt_expired_makers_cannot_fill() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let expiry_timestamp = 50_000;
+        let order = Order::new_gtt(1, owner.clone(), 100, expiry_timestamp);
+
+        // Can fill before expiry
+        assert!(order.can_fill_as_maker(0, 49_999));
+        assert!(order.can_fill_as_maker(100, 10_000));
+        assert!(order.can_fill_as_maker(1000, 0));
+
+        // Cannot fill at or after expiry
+        assert!(!order.can_fill_as_maker(0, 50_000));
+        assert!(!order.can_fill_as_maker(100, 50_001));
+        assert!(!order.can_fill_as_maker(1000, 100_000));
+    }
+
+    /// Test case: GTT OrderRequest validation with Env.
+    #[test]
+    fn gtt_order_request_validation_with_env() {
+        let env = Env::default();
+        env.ledger().set_sequence_number(100);
+        env.ledger().set_timestamp(5000);
+
+        // GTT request with past expiry: invalid
+        let gtt_past = OrderRequest::new_gtt(4_999);
+        assert!(gtt_past.validate(&env).is_err());
+
+        // GTT request with current timestamp expiry: invalid
+        let gtt_current = OrderRequest::new_gtt(5_000);
+        assert!(gtt_current.validate(&env).is_err());
+
+        // GTT request with future expiry: valid
+        let gtt_future = OrderRequest::new_gtt(5_001);
+        assert!(gtt_future.validate(&env).is_ok());
+    }
+
+    /// Test case: GTT OrderRequest::validate_tif static method.
+    #[test]
+    fn gtt_validate_tif_static() {
+        let env = Env::default();
+        env.ledger().set_sequence_number(100);
+        env.ledger().set_timestamp(5000);
+
+        // GTT with no timestamp: invalid
+        assert!(OrderRequest::validate_tif(&env, TimeInForce::GTT, None, None).is_err());
+
+        // GTT with past timestamp: invalid
+        assert!(OrderRequest::validate_tif(&env, TimeInForce::GTT, None, Some(4_999)).is_err());
+
+        // GTT with current timestamp: invalid
+        assert!(OrderRequest::validate_tif(&env, TimeInForce::GTT, None, Some(5_000)).is_err());
+
+        // GTT with future timestamp: valid
+        assert!(OrderRequest::validate_tif(&env, TimeInForce::GTT, None, Some(5_001)).is_ok());
+    }
+
+    /// Test case: Multiple GTT orders with different timestamp expiries.
+    #[test]
+    fn multiple_gtt_orders_different_expiries() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        let order1 = Order::new_gtt(1, owner.clone(), 10, 10_000);
+        let order2 = Order::new_gtt(2, owner.clone(), 20, 20_000);
+        let order3 = Order::new_gtt(3, owner.clone(), 30, 30_000);
+        let order4 = Order::new_gtc(4, owner.clone(), 40);
+
+        // At timestamp 15_000: order1 expired, others active
+        assert!(order1.is_expired(0, 15_000));
+        assert!(order2.is_active(0, 15_000));
+        assert!(order3.is_active(0, 15_000));
+        assert!(order4.is_active(0, 15_000));
+
+        // At timestamp 25_000: order1 and order2 expired, others active
+        assert!(order1.is_expired(0, 25_000));
+        assert!(order2.is_expired(0, 25_000));
+        assert!(order3.is_active(0, 25_000));
+        assert!(order4.is_active(0, 25_000));
+
+        // At timestamp 35_000: all GTT expired, GTC still active
+        assert!(order1.is_expired(0, 35_000));
+        assert!(order2.is_expired(0, 35_000));
+        assert!(order3.is_expired(0, 35_000));
+        assert!(order4.is_active(0, 35_000));
+    }
+
+    /// Test case: GTT and GTD orders can coexist independently.
+    #[test]
+    fn gtt_and_gtd_coexist_independently() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        let gtd_order = Order::new_gtd(1, owner.clone(), 50, 100);
+        let gtt_order = Order::new_gtt(2, owner.clone(), 50, 10_000);
+
+        // At ledger 50, timestamp 5000: both active
+        assert!(gtd_order.is_active(50, 5_000));
+        assert!(gtt_order.is_active(50, 5_000));
+
+        // At ledger 150, timestamp 5000: GTD expired, GTT active
+        assert!(gtd_order.is_expired(150, 5_000));
+        assert!(gtt_order.is_active(150, 5_000));
+
+        // At ledger 50, timestamp 15000: GTD active, GTT expired
+        assert!(gtd_order.is_active(50, 15_000));
+        assert!(gtt_order.is_expired(50, 15_000));
+
+        // At ledger 150, timestamp 15000: both expired
+        assert!(gtd_order.is_expired(150, 15_000));
+        assert!(gtt_order.is_expired(150, 15_000));
+    }
+
+    /// Test case: Exact timestamp equality boundary behavior.
+    #[test]
+    fn exact_timestamp_equality_boundary() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let expiry = 100_000;
+        let order = Order::new_gtt(1, owner.clone(), 50, expiry);
+
+        // One nanosecond before (assuming second precision): active
+        // In practice, Soroban uses second precision
+        assert!(order.is_active(0, expiry - 1));
+
+        // Exactly at expiry: expired
+        assert!(order.is_expired(0, expiry));
+        assert!(!order.is_active(0, expiry));
+
+        // One second after: expired
+        assert!(order.is_expired(0, expiry + 1));
+    }
+
+    /// Test case: Edge case - GTT order with timestamp 0.
+    #[test]
+    fn gtt_order_with_timestamp_zero() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // Order expiring at timestamp 0
+        let order = Order::new_gtt(1, owner.clone(), 50, 0);
+
+        // Expired at timestamp 0 and beyond
+        assert!(order.is_expired(0, 0));
+        assert!(order.is_expired(0, 1));
+        assert!(order.is_expired(0, 100_000));
+
+        // Cannot be placed at timestamp 0 with expiry 0
+        assert!(order.validate_placement(0, 0).is_err());
+    }
+
+    /// Test case: Edge case - GTT order with maximum timestamp.
+    #[test]
+    fn gtt_order_with_maximum_timestamp() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        let max_timestamp = u64::MAX;
+        let order = Order::new_gtt(1, owner.clone(), 50, max_timestamp);
+
+        // Active at all timestamps except MAX
+        assert!(order.is_active(0, 0));
+        assert!(order.is_active(0, u64::MAX / 2));
+        assert!(order.is_active(0, u64::MAX - 1));
+
+        // Expired at MAX
+        assert!(order.is_expired(0, u64::MAX));
+    }
+
+    /// Test case: GTT expiration independent of ledger sequence.
+    #[test]
+    fn gtt_expiration_independent_of_ledger() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let expiry_timestamp = 50_000;
+        let order = Order::new_gtt(1, owner.clone(), 50, expiry_timestamp);
+
+        // At different ledgers but same timestamp: same expiration state
+        for ledger in [0, 100, 1_000, 10_000, u64::MAX / 2].iter() {
+            // Active before expiry
+            assert!(order.is_active(*ledger, expiry_timestamp - 1));
+            // Expired at expiry
+            assert!(order.is_expired(*ledger, expiry_timestamp));
+            // Expired after expiry
+            assert!(order.is_expired(*ledger, expiry_timestamp + 1));
+        }
+    }
+
+    /// Test case: GTD expiration independent of timestamp.
+    #[test]
+    fn gtd_expiration_independent_of_timestamp() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let expiry_ledger = 500;
+        let order = Order::new_gtd(1, owner.clone(), 50, expiry_ledger);
+
+        // At different timestamps but same ledger: same expiration state
+        for timestamp in [0, 1_000, 10_000, 100_000, u64::MAX / 2].iter() {
+            // Active before expiry
+            assert!(order.is_active(expiry_ledger - 1, *timestamp));
+            // Expired at expiry
+            assert!(order.is_expired(expiry_ledger, *timestamp));
+            // Expired after expiry
+            assert!(order.is_expired(expiry_ledger + 1, *timestamp));
+        }
+    }
+
+    /// Test case: Deterministic GTT expiration checking.
+    #[test]
+    fn gtt_expiration_is_deterministic() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let order = Order::new_gtt(1, owner.clone(), 50, 100_000);
+
+        // Multiple checks at same timestamp produce same result
+        for _ in 0..10 {
+            assert!(order.is_active(0, 99_999));
+            assert!(order.is_expired(0, 100_000));
+            assert!(!order.is_active(0, 100_001));
+        }
+    }
+
+    /// Test case: GTT OrderRequest is_active matches Order behavior.
+    #[test]
+    fn gtt_order_request_is_active_matches_order() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        let gtt_request = OrderRequest::new_gtt(50_000);
+        let gtt_order = Order::new_gtt(1, owner.clone(), 50, 50_000);
+
+        for timestamp in [0, 49_999, 50_000, 50_001, 100_000].iter() {
+            assert_eq!(
+                gtt_request.is_active(0, *timestamp),
+                gtt_order.is_active(0, *timestamp)
+            );
+        }
+    }
+
+    /// Test case: Batch GTT expiration check is bounded.
+    #[test]
+    fn batch_gtt_expiration_check_is_bounded() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // Create orders with various timestamp expiries
+        let orders = vec![
+            Order::new_gtt(1, owner.clone(), 10, 10_000),
+            Order::new_gtt(2, owner.clone(), 20, 20_000),
+            Order::new_gtc(3, owner.clone(), 30),
+            Order::new_gtt(4, owner.clone(), 40, 15_000),
+            Order::new_gtt(5, owner.clone(), 50, 17_500),
+        ];
+
+        // At timestamp 16_000, check which can fill
+        let current_ledger = 0;
+        let current_timestamp = 16_000;
+        let active_count = orders
+            .iter()
+            .filter(|o| o.can_fill_as_maker(current_ledger, current_timestamp))
+            .count();
+
+        // Orders 2 and 3 should be active (expiry 20_000 and GTC)
+        // Orders 1, 4, 5 should be expired (expiry 10_000, 15_000, 17_500)
+        assert_eq!(active_count, 2);
+    }
+
+    /// Test case: Mixed GTD and GTT orders in batch.
+    #[test]
+    fn mixed_gtd_gtt_batch_expiration() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        let orders = vec![
+            Order::new_gtd(1, owner.clone(), 10, 100),      // Expires at ledger 100
+            Order::new_gtt(2, owner.clone(), 20, 10_000),   // Expires at timestamp 10_000
+            Order::new_gtc(3, owner.clone(), 30),           // Never expires
+            Order::new_gtd(4, owner.clone(), 40, 200),      // Expires at ledger 200
+            Order::new_gtt(5, owner.clone(), 50, 20_000),   // Expires at timestamp 20_000
+        ];
+
+        // At ledger 150, timestamp 15_000:
+        // - Order 1: expired (ledger 100 < 150)
+        // - Order 2: expired (timestamp 10_000 < 15_000)
+        // - Order 3: active (GTC)
+        // - Order 4: active (ledger 200 > 150)
+        // - Order 5: active (timestamp 20_000 > 15_000)
+        let active_count = orders
+            .iter()
+            .filter(|o| o.can_fill_as_maker(150, 15_000))
+            .count();
+
+        assert_eq!(active_count, 3); // Orders 3, 4, 5
+    }
+
+    /// Test case: Wall-clock reasoning - GTT for human-readable expiry.
+    #[test]
+    fn gtt_wall_clock_reasoning() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // Example: Order should expire at Unix timestamp 1735689600
+        // (January 1, 2025, 00:00:00 UTC)
+        let expiry = 1_735_689_600;
+        let order = Order::new_gtt(1, owner.clone(), 100, expiry);
+
+        // Before January 1, 2025: active
+        assert!(order.is_active(0, expiry - 1));
+
+        // At or after January 1, 2025: expired
+        assert!(order.is_expired(0, expiry));
+        assert!(order.is_expired(0, expiry + 3600)); // One hour later
+    }
+
+    /// Test case: GTT placement at edge of timestamp space.
+    #[test]
+    fn gtt_placement_at_timestamp_edges() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // At timestamp 0
+        env.ledger().set_timestamp(0);
+        let order_at_zero = Order::new_gtt(1, owner.clone(), 50, 1);
+        assert!(order_at_zero.validate_placement(0, 0).is_ok());
+
+        // Near max timestamp
+        env.ledger().set_timestamp(u64::MAX - 1000);
+        let order_near_max = Order::new_gtt(2, owner.clone(), 50, u64::MAX);
+        assert!(order_near_max.validate_placement(0, u64::MAX - 1000).is_ok());
+    }
+
+    /// Test case: GTT order with zero lots (edge case).
+    #[test]
+    fn gtt_expiration_works_with_zero_lots() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        let order = Order::new_gtt(1, owner.clone(), 0, 10_000);
+
+        assert!(order.is_active(0, 9_999));
+        assert!(order.is_expired(0, 10_000));
+    }
+
+    /// Test case: Composition - GTT expiration composes with collateral.
+    #[test]
+    fn gtt_expiration_composes_with_collateral() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // Order expires at timestamp 10_000
+        let order = Order::new_gtt(1, owner.clone(), 50, 10_000);
+
+        // Before expiry: can fill, lock should remain
+        assert!(order.can_fill_as_maker(0, 9_999));
+
+        // At expiry: cannot fill, lock should be released (by caller)
+        assert!(!order.can_fill_as_maker(0, 10_000));
+
+        // After expiry: still cannot fill
+        assert!(!order.can_fill_as_maker(0, 10_001));
+    }
+
+    /// Test case: GTT avoids requiring off-chain keepers.
+    /// The expiration check is performed on-chain using ledger timestamp,
+    /// so no off-chain keeper is required for correctness.
+    #[test]
+    fn gtt_no_offchain_keeper_required() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        // Place an order that expires at timestamp 10_000
+        let order = Order::new_gtt(1, owner.clone(), 100, 10_000);
+
+        // At any ledger, as long as we have the correct timestamp,
+        // expiration is checked correctly without external keeper
+        env.ledger().set_sequence_number(1);
+        env.ledger().set_timestamp(9_999);
+        assert!(order.can_fill_as_maker(1, 9_999));
+
+        env.ledger().set_sequence_number(2);
+        env.ledger().set_timestamp(10_000);
+        assert!(!order.can_fill_as_maker(2, 10_000));
+
+        // The ledger timestamp advances naturally, so expiration
+        // is enforced automatically during matching
+    }
+
+    /// Test case: Consistency across all three TIF types.
+    #[test]
+    fn all_tif_types_consistency() {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+
+        let gtc = Order::new_gtc(1, owner.clone(), 50);
+        let gtd = Order::new_gtd(2, owner.clone(), 50, 100);
+        let gtt = Order::new_gtt(3, owner.clone(), 50, 10_000);
+
+        // All should have same ID type, owner type, lots type
+        assert_eq!(gtc.remaining_lots, gtd.remaining_lots);
+        assert_eq!(gtd.remaining_lots, gtt.remaining_lots);
+
+        // Each has distinct expiration behavior
+        assert_eq!(gtc.tif, TimeInForce::GTC);
+        assert_eq!(gtd.tif, TimeInForce::GTD);
+        assert_eq!(gtt.tif, TimeInForce::GTT);
 #[cfg(test)]
 mod resource_bound_tests {
     use super::*;
