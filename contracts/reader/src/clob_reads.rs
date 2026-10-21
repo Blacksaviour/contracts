@@ -15,6 +15,62 @@ use soroban_sdk::{contracttype, Address, Env, Vec, token};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketRegistry {
+    /// Market ID (contract address)
+    pub id: Address,
+    
+    /// Base asset token
+    pub base: Address,
+    
+    /// Quote asset token
+    pub quote: Address,
+    
+    /// Ledger at which the market was created
+    pub created_ledger: u32,
+    
+    /// Ledger at which the market was marked closed/deleted (if any)
+    pub deleted_ledger: Option<u32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketCreatedEvent {
+    /// Market ID
+    pub market_id: Address,
+    
+    /// Base token
+    pub base: Address,
+    
+    /// Quote token
+    pub quote: Address,
+    
+    /// Base atoms per lot (immutable)
+    pub lot_size: u64,
+    
+    /// Price tick increment (immutable)
+    pub tick_size: u64,
+    
+    /// Maximum tick (immutable)
+    pub max_tick: u64,
+    
+    /// Taker fee rate (immutable)
+    pub taker_fee_rate: i128,
+    
+    /// Maker fee rate (immutable)
+    pub maker_fee_rate: i128,
+    
+    /// Minimum order lots (mutable but set at creation)
+    pub min_order_lots: u64,
+    
+    /// Max open orders per trader (mutable but set at creation)
+    pub max_open_orders_per_trader: u32,
+    
+    /// Ledger at which the market was created
+    pub created_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PriceLevel {
     /// Price tick (normalized to market tick size)
     pub price_tick: u64,
@@ -54,6 +110,22 @@ pub struct TopOfBook {
     
     /// Mid-price in ticks ((bid + ask) / 2), None if one-sided or overflow
     pub mid_price_ticks: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketRegistryPage {
+    /// Markets on this page
+    pub markets: Vec<MarketRegistry>,
+    
+    /// Page index (0-based)
+    pub page: u32,
+    
+    /// Total number of active markets (excluding deleted)
+    pub total_markets: u32,
+    
+    /// Whether more pages exist
+    pub has_next: bool,
 }
 
 #[contracttype]
@@ -258,7 +330,161 @@ pub fn check_available_balance(
     Ok(())
 }
 
+// ─── Market Creation ──────────────────────────────────────────────────────────
+
+/// Create and initialize a new market with full configuration
+///
+/// # Arguments
+/// * `base` - Base token address
+/// * `quote` - Quote token address
+/// * `lot_size` - Base atoms per lot (immutable)
+/// * `tick_size` - Price increment in scaled units (immutable)
+/// * `max_tick` - Maximum valid tick (immutable)
+/// * `taker_fee_rate` - Taker fee in basis points (immutable)
+/// * `maker_fee_rate` - Maker fee in basis points (immutable)
+/// * `min_order_lots` - Minimum order size in lots (mutable)
+/// * `max_open_orders_per_trader` - Per-trader limit (mutable)
+///
+/// # Authorization
+/// Requires admin signature via address.require_auth()
+///
+/// # Returns
+/// MarketCreatedEvent with full immutable configuration
+///
+/// # Errors
+/// - "market: identical tokens" if base == quote
+/// - "market: already exists" if market for this pair already created
+/// - "market: invalid configuration" if any parameter is invalid
+/// - "market: deployment failed" if contract instantiation fails
+///
+/// # Resource Bounds
+/// - CPU: O(1) — deterministic ID derivation + storage write
+/// - Memory: O(1)
+/// - Storage writes: 2 (market metadata + registry entry)
+///
+/// # Guarantees
+/// - Market ID is canonical and deterministic from (base, quote)
+/// - Configuration is immutable after creation
+/// - Event contains full configuration for indexer
+/// - Idempotent: same market cannot be created twice
+///
+/// # Implementation Status
+/// TODO: Issue #014 - Implement deterministic market deployment
+/// TODO: Issue #014 - Emit MarketCreated event to contract ledger
+pub fn create_market(
+    _env: Env,
+    _base: Address,
+    _quote: Address,
+    _lot_size: u64,
+    _tick_size: u64,
+    _max_tick: u64,
+    _taker_fee_rate: i128,
+    _maker_fee_rate: i128,
+    _min_order_lots: u64,
+    _max_open_orders_per_trader: u32,
+) -> Result<MarketCreatedEvent, &'static str> {
+    // Stub: Return placeholder
+    // Real implementation will:
+    // 1. Validate inputs via MarketConfig::validate()
+    // 2. Derive canonical MarketId from (base, quote)
+    // 3. Check if market already exists (prevent duplicates)
+    // 4. Deploy/initialize market contract with config
+    // 5. Store market metadata in registry
+    // 6. Emit MarketCreated event with full configuration
+    // 7. Return event for client confirmation
+    
+    Ok(MarketCreatedEvent {
+        market_id: _base.clone(), // Placeholder
+        base: _base,
+        quote: _quote,
+        lot_size: _lot_size,
+        tick_size: _tick_size,
+        max_tick: _max_tick,
+        taker_fee_rate: _taker_fee_rate,
+        maker_fee_rate: _maker_fee_rate,
+        min_order_lots: _min_order_lots,
+        max_open_orders_per_trader: _max_open_orders_per_trader,
+        created_ledger: 0,
+    })
+}
+
 // ─── Read Functions (Stub Implementations) ────────────────────────────────────
+
+/// Enumerate markets in the registry with pagination
+///
+/// # Arguments
+/// * `page` - Page number (0-based, capped at registry size / 100)
+/// * `include_deleted` - Whether to include soft-deleted markets
+///
+/// # Returns
+/// One page of up to 100 markets with pagination metadata
+///
+/// # Guarantees
+/// - Enumeration never reads an unbounded list
+/// - O(1) lookup per market (individual metadata loads)
+/// - Exactly `MARKETS_PER_PAGE` = 100 per page bounds resource usage
+/// - Total pages = ceil(total_markets / 100)
+///
+/// # Resource Bounds
+/// - CPU: O(markets_on_page) — bounded by page size
+/// - Memory: O(100) — fixed per-page allocation
+/// - Storage reads: O(1 + markets_on_page) — one index read + market loads
+///
+/// # Implementation Status
+/// TODO: Issue #015 - Load market registry pages from storage
+pub fn enumerate_markets(
+    _env: Env,
+    page: u32,
+    include_deleted: bool,
+) -> Result<MarketRegistryPage, &'static str> {
+    // Stub: Return empty page
+    // Real implementation will:
+    // 1. Load total market count
+    // 2. Validate page number
+    // 3. Load market IDs for this page from paginated storage
+    // 4. Load metadata for each market ID
+    // 5. Filter by deleted_ledger if include_deleted is false
+    // 6. Return page with has_next = true if more markets exist
+    
+    Ok(MarketRegistryPage {
+        markets: Vec::new(&_env),
+        page,
+        total_markets: 0,
+        has_next: false,
+    })
+}
+
+/// Look up a single market by ID
+///
+/// # Arguments
+/// * `market_id` - The market address to look up
+///
+/// # Returns
+/// Market metadata including base/quote tokens and creation time
+///
+/// # Guarantees
+/// - O(1) lookup: direct storage access by market ID
+/// - Returns None if market does not exist or is not yet synced
+///
+/// # Resource Bounds
+/// - CPU: O(1)
+/// - Memory: O(1)
+/// - Storage reads: 1 (single metadata lookup)
+///
+/// # Implementation Status
+/// TODO: Issue #015 - Load individual market metadata from storage
+pub fn lookup_market(
+    _env: Env,
+    market_id: Address,
+) -> Result<Option<MarketRegistry>, &'static str> {
+    // Stub: Return None
+    // Real implementation will:
+    // 1. Load market metadata by ID from storage
+    // 2. Return None if not found
+    // 3. Return Some(metadata) if found
+    
+    Ok(None)
+}
 
 /// Read L2 order book depth with bounded pagination
 ///
