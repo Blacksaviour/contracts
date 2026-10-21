@@ -30,8 +30,9 @@ behavior in v1 may depend on them.
 - Stop, post-only, immediate-or-cancel, and fill-or-kill orders. v1 time-in-force is limited to
   GTC and GTD (section 5.3).
 - In-place order amendment. A trader changes an order by cancelling it and placing a new one.
-- Trading fees. Fees are not defined by this document. Any fee MUST be applied as a separate
-  transfer that preserves asset conservation (section 9.1).
+- Maker rebates (negative maker fees) and historical-volume fee tiers. v1 maker and taker fees
+  are defined in `docs/fee-accounting.md`. Each fee MUST be applied as part of its fill, in a way
+  that preserves asset conservation (invariant I1).
 
 ## 3. Markets and parameters
 
@@ -42,18 +43,18 @@ is referenced by its Stellar Asset Contract address, like every other token.
 Each market has the following parameters, set once at creation from trusted configuration and
 immutable afterwards:
 
-| Parameter | Type | Meaning |
-|-----------|------|---------|
-| `lot_size` | `u64`, `> 0` | Base atoms per lot. All order sizes are whole lots. |
+| Parameter   | Type         | Meaning                                                 |
+| ----------- | ------------ | ------------------------------------------------------- |
+| `lot_size`  | `u64`, `> 0` | Base atoms per lot. All order sizes are whole lots.     |
 | `tick_size` | `u64`, `> 0` | Price increment, scaled by `PRICE_SCALE` (section 4.1). |
 
 Constants shared by all markets:
 
-| Constant | Value | Meaning |
-|----------|-------|---------|
-| `PRICE_SCALE` | `10^8` | Denominator for scaled prices. |
-| `MAX_TICK` | implementation constant | Largest valid tick index. |
-| `MAX_MATCH_STEPS` | implementation constant | Work budget per transaction (section 10). |
+| Constant          | Value                   | Meaning                                                                                                           |
+| ----------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `PRICE_SCALE`     | `10^8`                  | Denominator for scaled prices. Defined in `clob_settlement_core/src/lib.rs`.                                      |
+| `MAX_TICK`        | implementation constant | Largest valid tick index. Set by benchmark harness; defined in `clob_settlement_core/src/lib.rs`.                 |
+| `MAX_MATCH_STEPS` | implementation constant | Work budget per transaction (section 10). Set by benchmark harness; defined in `clob_settlement_core/src/lib.rs`. |
 
 ## 4. Units, price, and rounding
 
@@ -87,12 +88,12 @@ are used:
 
 The rules below are binding. They are chosen so that every token atom is accounted for.
 
-| Quantity | Rounding | Reason |
-|----------|----------|--------|
-| Quote locked by a bid for a remaining amount `r` lots | `Up(quote(r * lot_size, s))` | The trader never under-reserves. |
-| Base locked by an ask for a remaining amount `r` lots | exact, `r * lot_size` | Base is never divided. |
-| Quote paid to the seller for a fill of `f` lots | `Down(quote(f * lot_size, s))` | The protocol never over-pays a seller. |
-| Quote debited from the buyer for a fill | difference of two `Up` locks (section 7.2) | Buyer debit always covers seller credit. |
+| Quantity                                              | Rounding                                   | Reason                                   |
+| ----------------------------------------------------- | ------------------------------------------ | ---------------------------------------- |
+| Quote locked by a bid for a remaining amount `r` lots | `Up(quote(r * lot_size, s))`               | The trader never under-reserves.         |
+| Base locked by an ask for a remaining amount `r` lots | exact, `r * lot_size`                      | Base is never divided.                   |
+| Quote paid to the seller for a fill of `f` lots       | `Down(quote(f * lot_size, s))`             | The protocol never over-pays a seller.   |
+| Quote debited from the buyer for a fill               | difference of two `Up` locks (section 7.2) | Buyer debit always covers seller credit. |
 
 The difference between the buyer's debit and the seller's credit is a **rounding residue**. It is
 less than one quote atom per fill. The residue is credited to the market's protocol dust account
@@ -104,15 +105,15 @@ less than one quote atom per fill. The residue is credited to the market's proto
 
 Each order has:
 
-| Field | Type | Meaning |
-|-------|------|---------|
-| `id` | `u64` | Per-market sequence number. Strictly increasing and never reused. This is the order's time priority. |
-| `owner` | `Address` | The account that placed the order. |
-| `side` | `Bid` or `Ask` | `Bid` buys base with quote. `Ask` sells base for quote. |
-| `tick` | `u64` | Limit price. |
-| `remaining_lots` | `u64` | Unfilled size. Always `> 0` while the order rests. |
-| `locked` | `i128` | Tokens currently locked for this order (section 5.2). |
-| `tif` | `GTC` or `GTD(expiry_ledger)` | Time in force (section 5.3). |
+| Field            | Type                          | Meaning                                                                                              |
+| ---------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `id`             | `u64`                         | Per-market sequence number. Strictly increasing and never reused. This is the order's time priority. |
+| `owner`          | `Address`                     | The account that placed the order.                                                                   |
+| `side`           | `Bid` or `Ask`                | `Bid` buys base with quote. `Ask` sells base for quote.                                              |
+| `tick`           | `u64`                         | Limit price.                                                                                         |
+| `remaining_lots` | `u64`                         | Unfilled size. Always `> 0` while the order rests.                                                   |
+| `locked`         | `i128`                        | Tokens currently locked for this order (section 5.2).                                                |
+| `tif`            | `GTC` or `GTD(expiry_ledger)` | Time in force (section 5.3).                                                                         |
 
 ### 5.2 Locking
 
@@ -296,20 +297,20 @@ Removing an expired order emits an event, and the removal does not change any fi
 The following invariants MUST hold after every successful transaction. A transaction that would
 violate one MUST revert.
 
-| ID | Invariant | Planned test category |
-|----|-----------|-----------------------|
-| I1 | **Asset conservation.** For each token, the sum of every account's available and locked balances, plus the protocol dust account and any fee account, is unchanged by trading. Deposits and withdrawals change it by exactly the amount moved. | Property tests over random sequences of placements, fills, cancels, and expiries, checked after each operation. |
-| I2 | **Solvency.** The contract's token balance is at least the sum of all account totals and the protocol dust account. | Solvency check in every integration test, plus malicious-token and reentrancy tests. |
-| I3 | **Lock consistency.** Each order's `locked` equals the value given in section 5.2. Each account's locked balance equals the sum of its orders' locks, and `available + locked = total` with no negative balance. | Unit tests for each operation, and property tests that recompute locks from scratch. |
-| I4 | **No crossed resting book.** When both sides have orders, the best bid tick is strictly less than the best ask tick. | Adversarial sequences that include bounded stops and self-trade stops, checked after each transaction. |
-| I5 | **Price-time priority.** A fill never happens at a worse tick than an available better tick. Within a tick, fills happen in ascending `id`. | Ordering tests with equal-price orders inserted in varying sequences. |
-| I6 | **Execution at maker price.** Every fill's tick equals the maker's tick. | Positive tests with price improvement on the taker side. |
-| I7 | **Sequence uniqueness.** Order `id`s are strictly increasing per market and never reused, including after cancels and bounded stops. | Sequence tests across mixed placements and cancels. |
-| I8 | **No zero-size orders.** No stored order has `remaining_lots = 0`. | Post-condition assertions in matching and cancel tests. |
-| I9 | **Bounded work.** A transaction performs at most `MAX_MATCH_STEPS` steps (section 10). No operation iterates over an unbounded collection. | Worst-case fixtures that exhaust the budget, and resource benchmarks once the harness exists. |
-| I10 | **Residue bounds.** Each fill's rounding residue lies in `[0, 1)` quote atoms, and the protocol dust account never decreases. | Property tests over random ticks, tick sizes, and sizes, including the boundaries of `MAX_TICK` and maximum lots. |
-| I11 | **Expired orders do not fill.** No fill involves a GTD order whose `expiry_ledger` is at or before the current ledger. | Tests that advance the ledger across an expiry boundary. |
-| I12 | **No self-trade.** No fill occurs between two orders with the same owner. | Self-trade fixtures on both sides of the book. |
+| ID  | Invariant                                                                                                                                                                                                                                      | Planned test category                                                                                             |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| I1  | **Asset conservation.** For each token, the sum of every account's available and locked balances, plus the protocol dust account and any fee account, is unchanged by trading. Deposits and withdrawals change it by exactly the amount moved. | Property tests over random sequences of placements, fills, cancels, and expiries, checked after each operation.   |
+| I2  | **Solvency.** The contract's token balance is at least the sum of all account totals and the protocol dust account.                                                                                                                            | Solvency check in every integration test, plus malicious-token and reentrancy tests.                              |
+| I3  | **Lock consistency.** Each order's `locked` equals the value given in section 5.2. Each account's locked balance equals the sum of its orders' locks, and `available + locked = total` with no negative balance.                               | Unit tests for each operation, and property tests that recompute locks from scratch.                              |
+| I4  | **No crossed resting book.** When both sides have orders, the best bid tick is strictly less than the best ask tick.                                                                                                                           | Adversarial sequences that include bounded stops and self-trade stops, checked after each transaction.            |
+| I5  | **Price-time priority.** A fill never happens at a worse tick than an available better tick. Within a tick, fills happen in ascending `id`.                                                                                                    | Ordering tests with equal-price orders inserted in varying sequences.                                             |
+| I6  | **Execution at maker price.** Every fill's tick equals the maker's tick.                                                                                                                                                                       | Positive tests with price improvement on the taker side.                                                          |
+| I7  | **Sequence uniqueness.** Order `id`s are strictly increasing per market and never reused, including after cancels and bounded stops.                                                                                                           | Sequence tests across mixed placements and cancels.                                                               |
+| I8  | **No zero-size orders.** No stored order has `remaining_lots = 0`.                                                                                                                                                                             | Post-condition assertions in matching and cancel tests.                                                           |
+| I9  | **Bounded work.** A transaction performs at most `MAX_MATCH_STEPS` steps (section 10). No operation iterates over an unbounded collection.                                                                                                     | Worst-case fixtures that exhaust the budget, and resource benchmarks once the harness exists.                     |
+| I10 | **Residue bounds.** Each fill's rounding residue lies in `[0, 1)` quote atoms, and the protocol dust account never decreases.                                                                                                                  | Property tests over random ticks, tick sizes, and sizes, including the boundaries of `MAX_TICK` and maximum lots. |
+| I11 | **Expired orders do not fill.** No fill involves a GTD order whose `expiry_ledger` is at or before the current ledger.                                                                                                                         | Tests that advance the ledger across an expiry boundary.                                                          |
+| I12 | **No self-trade.** No fill occurs between two orders with the same owner.                                                                                                                                                                      | Self-trade fixtures on both sides of the book.                                                                    |
 
 ## 10. Bounded matching
 
@@ -361,12 +362,12 @@ for 2 lots. There are no bids.
 
 A trader places bid `id 4` at tick 10 for 6 lots.
 
-| Step | Action | Taker remaining | Taker lock | Debit | Credit to seller | Residue |
-|------|--------|-----------------|------------|-------|------------------|---------|
-| Lock | Lock `Up(6 * 10) = 60` | 6 | 60 | | | |
-| 1 | Fill `id 1`, 2 lots at tick 10 | 4 | `40` | `60 - 40 = 20` | `Down(2 * 10) = 20` | 0 |
-| 2 | Fill `id 2`, 2 lots at tick 10 | 2 | `20` | `40 - 20 = 20` | `Down(2 * 10) = 20` | 0 |
-| Stop | Budget exhausted, `id 3` still crosses | 2 | released | `20` released | | |
+| Step | Action                                 | Taker remaining | Taker lock | Debit          | Credit to seller    | Residue |
+| ---- | -------------------------------------- | --------------- | ---------- | -------------- | ------------------- | ------- |
+| Lock | Lock `Up(6 * 10) = 60`                 | 6               | 60         |                |                     |         |
+| 1    | Fill `id 1`, 2 lots at tick 10         | 4               | `40`       | `60 - 40 = 20` | `Down(2 * 10) = 20` | 0       |
+| 2    | Fill `id 2`, 2 lots at tick 10         | 2               | `20`       | `40 - 20 = 20` | `Down(2 * 10) = 20` | 0       |
+| Stop | Budget exhausted, `id 3` still crosses | 2               | released   | `20` released  |                     |         |
 
 Result: 4 lots filled at tick 10. The trader pays 40 quote, receives 4 base, and gets 20 quote
 released. Ask `id 3` (2 lots) still rests at tick 10. No bid rests, so the book is not crossed.
@@ -392,10 +393,10 @@ Conservation holds: the buyer's quote falls by 14, the seller gains 13, and the 
 Same market as Example B. Resting asks at tick 3, in FIFO order: `id 1` for 1 lot, `id 2` for
 2 lots. A bid `id 3` at tick 3 for 3 lots arrives. It locks 14.
 
-| Fill | Lots | Lock before | Lock after | Debit | Credit | Residue |
-|------|------|-------------|------------|-------|--------|---------|
-| `id 1` | 1 | 14 | `Up(2 * 4.5) = 9` | `5` | `Down(4.5) = 4` | 1 |
-| `id 2` | 2 | 9 | `0` | `9` | `Down(9) = 9` | 0 |
+| Fill   | Lots | Lock before | Lock after        | Debit | Credit          | Residue |
+| ------ | ---- | ----------- | ----------------- | ----- | --------------- | ------- |
+| `id 1` | 1    | 14          | `Up(2 * 4.5) = 9` | `5`   | `Down(4.5) = 4` | 1       |
+| `id 2` | 2    | 9           | `0`               | `9`   | `Down(9) = 9`   | 0       |
 
 Totals: the buyer is debited 14, the seller is credited 13, and the dust account gains 1. This
 matches Example B, so the split does not change the outcome. That is the point of the rule in
@@ -425,3 +426,66 @@ should be confirmed in review before implementation starts.
    transfer.
 4. **`MAX_MATCH_STEPS` and `MAX_TICK`.** Both are implementation constants. Their values are set by
    the benchmark harness and the contract's resource limits, not by this document.
+
+## 12. Governance and resource-bound constants (Phase 0, #013)
+
+All resource-bound constants and market parameters are defined in `clob_settlement_core/src/lib.rs` and validated through runtime guards. This section documents the governance policy for these constants.
+
+### 12.1 Consensus-critical constants
+
+The following constants are consensus-critical. Every contract and SDK implementation must use identical definitions. Changes to these constants require protocol governance.
+
+- `PRICE_SCALE = 10^8`: Fixed-point denominator for scaled prices (section 4.1). Immutable, set globally.
+- `MAX_MATCH_STEPS`: Maximum work budget per transaction (section 10). Set by benchmark harness.
+- `MAX_TICK`: Maximum valid tick index (section 4.1). Set by benchmark harness.
+
+All constants are implemented as `pub const` in `clob_settlement_core/src/lib.rs` and must be referenced directly by contract and SDK code, never recomputed.
+
+### 12.2 Bounded-work constants
+
+The following constants bound work in matching, batch operations, and queries. They prevent unbounded loops and ensure Soroban resource exhaustion cannot occur.
+
+**Matching bounds:**
+
+- `MAX_MATCHES_PER_CALL = 100` (placeholder): Maximum fills per matching call. Each fill is O(1) work. When exhausted, matching stops and the client must resubmit the remainder as a new order. Rationale: Soroban transactions have finite CPU and ledger write budgets; fills dominate the work.
+- `MAX_LEVELS_CROSSED_PER_CALL = 100` (placeholder): Maximum price levels examined during one matching traversal. When exhausted, matching stops at the next non-empty level and client must resubmit. Rationale: Finding the next non-empty level on a sparse book requires scanning empty ticks. Without a bound, an adversarial order book could force quadratic time. Implementation must use an ordered index or bitmap to scan levels in O(1) per level.
+
+**Batch and query bounds:**
+
+- `MAX_BATCH_SIZE = 50` (placeholder): Maximum orders per batch operation (e.g., batch cancel, batch place). Batch operations are not atomic; exceeding the limit requires multiple transactions. Rationale: Each order operation (create, cancel, expiry) requires ledger reads/writes.
+- `MAX_DEPTH_QUERY_SIZE = 100` (placeholder): Maximum orders returned in a depth query (market data snapshot). Clients paginate through large books. Rationale: Depth queries scan the book; bounding them keeps query costs predictable.
+- `MAX_ORDER_PAYLOAD_BYTES = 256` (placeholder): Maximum size of a single order's encoding (owner, side, tick, size, tif, etc.). Rationale: Soroban transactions have a hard size limit. Bounding per-order size ensures reasonable batch sizes fit within transaction budgets.
+
+### 12.3 Runtime guards
+
+The following functions validate resource-bound parameters at runtime:
+
+- `validate_tick(tick: u64)`: Rejects ticks that are zero or exceed `MAX_TICK`. Called when an order is placed.
+- `validate_lot_size(lot_size: u64)`: Rejects zero lot size. Called at market creation.
+- `validate_tick_size(tick_size: u64)`: Rejects zero tick size. Called at market creation.
+- `validate_match_steps(steps: u32)`: Rejects step counts exceeding `MAX_MATCH_STEPS`. Called during matching budget checks.
+- `validate_matches_per_call(count: u32)`: Rejects fill counts exceeding `MAX_MATCHES_PER_CALL`. Called during matching.
+- `validate_levels_crossed_per_call(count: u32)`: Rejects level counts exceeding `MAX_LEVELS_CROSSED_PER_CALL`. Called during book traversal.
+- `validate_batch_size(size: u32)`: Rejects batch sizes exceeding `MAX_BATCH_SIZE`. Called at batch operation acceptance.
+- `validate_depth_query_size(size: u32)`: Rejects query sizes exceeding `MAX_DEPTH_QUERY_SIZE`. Called when returning market data.
+- `validate_order_payload_size(size: u32)`: Rejects order payloads exceeding `MAX_ORDER_PAYLOAD_BYTES`. Called at order creation.
+
+Guards use compile-time constants for bounds, ensuring no unbounded configuration is possible. Violations are rejected with deterministic error messages before any state change.
+
+### 12.4 Continuation and recovery
+
+When a bound is exceeded, matching and batch operations **do not fail**. Instead:
+
+- **Matching:** Stops deterministically at the bound. Already-completed fills are final. Client must resubmit a new order for the remainder.
+- **Batch:** Stops after processing as many orders as possible up to the bound. Processed orders are final; client retries unprocessed orders.
+- **Queries:** Return results up to the bound. Client uses continuation tokens to fetch the next page.
+
+This design ensures bounded resource use without sacrificing liveness or completeness.
+
+### 12.5 Trusted configuration and verification
+
+Market creation consumes trusted configuration (lot size, tick size) from governance. These values must be validated at market creation and immutable thereafter. No caller-supplied infrastructure addresses are used; all resource budgets are fixed at the protocol level.
+
+- Positive-path tests verify that valid values within bounds are accepted by all guards.
+- Negative-path tests verify that out-of-bounds and invalid values are rejected with appropriate errors.
+- See `clob_settlement_core/src/lib.rs` tests modules `resource_bound_tests` and `bounded_work_tests` for the full suite.
